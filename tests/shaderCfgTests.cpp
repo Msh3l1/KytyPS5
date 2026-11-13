@@ -7512,8 +7512,15 @@ void TestMemoryFedScalarLeafCall() {
   const uint32_t joined[] = {
       EncodeSopp(0x04, 2), EncodeSMovB32(14, 129), EncodeSopp(0x02, 1),
       EncodeSMovB32(14, 130), EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
-  ExpectFatal([&] { (void)PrepareShaderSource(joined, options); },
-              "ambiguous reaching definitions were accepted for a call target");
+  const auto joined_skipped = PrepareShaderSource(joined, options);
+  Check(joined_skipped.unsupported_call_pc == 16u && joined_skipped.calls.empty(),
+        "ambiguous reaching definitions did not report unsupported call site");
+  const uint32_t loop_overwritten_target[] = {
+      EncodeSMovB32(14, 129), EncodeSMovB32(15, 128), EncodeSop1(0x21, 14, 14),
+      EncodeSMovB32(14, 130), EncodeSopp(0x05, 0xfffdu), EncodeSopp(0x01)};
+  const auto loop_target_skipped = PrepareShaderSource(loop_overwritten_target, options);
+  Check(loop_target_skipped.unsupported_call_pc == 8u && loop_target_skipped.calls.empty(),
+        "loop-overwritten call target did not report unsupported call site");
   const uint32_t multiple[] = {EncodeSop1(0x21, 14, 14), EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
   ExpectFatal([&] { (void)PrepareShaderSource(multiple, options); },
               "a native return pair was accepted as a later call target");

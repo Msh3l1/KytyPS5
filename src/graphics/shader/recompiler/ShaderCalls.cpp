@@ -22,6 +22,32 @@
 
 namespace Libs::Graphics::ShaderRecompiler {
 
+namespace {
+
+bool ContainsUnsupportedCallTargetSource(IR::Value value) {
+	std::vector<IR::Value> stack {value.Resolve()};
+	std::vector<const IR::Inst*> visited;
+	while (!stack.empty()) {
+		const auto current = stack.back().Resolve();
+		stack.pop_back();
+		const auto* inst = current.TryInstruction();
+		if (inst == nullptr) continue;
+		if (std::ranges::find(visited, inst) != visited.end()) continue;
+		visited.push_back(inst);
+		const auto op = inst->GetOpcode();
+		if (op == IR::ValueOpcode::ReadConstBuffer || op == IR::ValueOpcode::UndefU32 ||
+		    op == IR::ValueOpcode::UndefU1) {
+			return true;
+		}
+		for (size_t i = 0; i < inst->NumArgs(); ++i) {
+			stack.push_back(inst->Arg(i));
+		}
+	}
+	return false;
+}
+
+} // namespace
+
 void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 	using namespace IR;
 	EXIT_NOT_IMPLEMENTED(options.stage != ShaderType::Compute);
@@ -110,7 +136,7 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 		for (uint32_t i = 0; i < 2u; ++i) {
 			const auto value = Register(site.instruction, call.src0.reg + i);
 			if (!ValidateRuntimeValue(query, value, RuntimeValueType::Integer)) {
-				EXIT_IF(value.Instruction()->GetOpcode() != ValueOpcode::ReadConstBuffer);
+				EXIT_IF(!ContainsUnsupportedCallTargetSource(value));
 				source.unsupported_call_pc = call.pc;
 				source.calls.clear();
 				return;
