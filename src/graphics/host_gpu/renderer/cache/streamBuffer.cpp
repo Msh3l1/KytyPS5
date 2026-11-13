@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <vk_mem_alloc.h>
@@ -20,6 +21,24 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 constexpr vk::AccessFlags MEMORY_ACCESS =
     vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
 
+[[nodiscard]] bool PreferHostStreamBuffer(const GraphicContext& graphics) {
+	if (const char* value = std::getenv("KYTY_STREAM_IN_VRAM");
+	    value != nullptr && value[0] == '1') {
+		return false;
+	}
+	if (graphics.physical_device_properties.deviceType != vk::PhysicalDeviceType::eDiscreteGpu) {
+		return false;
+	}
+	uint64_t device_local_bytes = 0;
+	for (uint32_t i = 0; i < graphics.physical_device_memory_properties.memoryHeapCount; i++) {
+		const auto& heap = graphics.physical_device_memory_properties.memoryHeaps[i];
+		if (static_cast<bool>(heap.flags & vk::MemoryHeapFlagBits::eDeviceLocal)) {
+			device_local_bytes += heap.size;
+		}
+	}
+	return device_local_bytes > 0 && device_local_bytes <= (8704ull << 20u);
+}
+
 [[nodiscard]] VmaAllocationCreateFlags AllocationFlags(MemoryUsage usage) {
 	switch (usage) {
 		case MemoryUsage::Upload:
@@ -33,10 +52,12 @@ constexpr vk::AccessFlags MEMORY_ACCESS =
 	return {};
 }
 
-[[nodiscard]] VmaMemoryUsage AllocationUsage(MemoryUsage usage) {
+[[nodiscard]] VmaMemoryUsage AllocationUsage(MemoryUsage usage, const GraphicContext& graphics) {
 	switch (usage) {
-		case MemoryUsage::DeviceLocal:
-		case MemoryUsage::Stream: return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+		case MemoryUsage::DeviceLocal: return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+		case MemoryUsage::Stream:
+			return PreferHostStreamBuffer(graphics) ? VMA_MEMORY_USAGE_AUTO_PREFER_HOST
+			                                        : VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
 		case MemoryUsage::Upload:
 		case MemoryUsage::Download: return VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
 	}
@@ -73,7 +94,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	VmaAllocationCreateInfo allocation_info {};
 	allocation_info.flags =
 	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | AllocationFlags(usage);
-	allocation_info.usage = AllocationUsage(usage);
+	allocation_info.usage = AllocationUsage(usage, graphics);
 	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}
 	                                     : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;

@@ -887,6 +887,29 @@ void TestTrackerProtectSharesBackingReads() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestLiveThreadStackSkipsTransientProtect() {
+	using namespace Libs::LibKernel::Memory;
+	const char* test = "LiveThreadStackSkipsTransientProtect";
+	const auto  base = MapPageBeforeHole(test, "live_stack_skip_protect");
+	const auto* bytes = reinterpret_cast<const uint8_t*>(base);
+	Check(test, bytes != nullptr, "valid mapped backing");
+
+	AddLiveThreadStack(base + 0x1000, 0x1000);
+	Check(test, ProtectGuestHostMemory(base, SceKernelPageSize, Common::VirtualMemory::Mode::Read),
+	      "ProtectGuestHostMemory Read while live stack registered");
+	// Page 1 (base + 0x1000) stays writable while registered as a live stack.
+	*reinterpret_cast<volatile uint32_t*>(base + 0x1000) = 0x12345678u;
+	Check(test, *reinterpret_cast<const volatile uint32_t*>(base + 0x1000) == 0x12345678u,
+	      "live stack page stayed writable during transient Read");
+
+	RemoveLiveThreadStack(base + 0x1000, 0x1000);
+	Check(test,
+	      ProtectGuestHostMemory(base, SceKernelPageSize, Common::VirtualMemory::Mode::ReadWrite),
+	      "ProtectGuestHostMemory ReadWrite after stack removal");
+	CheckOk(test, KernelMunmap(base, SceKernelPageSize), "KernelMunmap");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestGuestAddressSpaceHasNoFixedFallback() {
 	const char* test            = "GuestAddressSpaceHasNoFixedFallback";
 	const auto  unowned_address = reinterpret_cast<void*>(0x10000);
@@ -5982,6 +6005,7 @@ int main(int argc, char** argv) {
 	RunTest(TestQueriesSkipOperationLock);
 	RunTest(TestQueriesWaitForStateChanges);
 	RunTest(TestTrackerProtectSharesBackingReads);
+	RunTest(TestLiveThreadStackSkipsTransientProtect);
 	RunTest(TestClampRangeSkipsStateLock);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);

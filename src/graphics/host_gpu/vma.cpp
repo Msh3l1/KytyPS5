@@ -21,8 +21,27 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 
 namespace Libs::Graphics {
+
+namespace {
+
+[[nodiscard]] bool HasConstrainedDeviceLocalHeap(const GraphicContext& graphics) {
+	if (graphics.physical_device_properties.deviceType != vk::PhysicalDeviceType::eDiscreteGpu) {
+		return false;
+	}
+	uint64_t device_local_bytes = 0;
+	for (uint32_t i = 0; i < graphics.physical_device_memory_properties.memoryHeapCount; i++) {
+		const auto& heap = graphics.physical_device_memory_properties.memoryHeaps[i];
+		if (static_cast<bool>(heap.flags & vk::MemoryHeapFlagBits::eDeviceLocal)) {
+			device_local_bytes += heap.size;
+		}
+	}
+	return device_local_bytes > 0 && device_local_bytes <= (8704ull << 20u);
+}
+
+} // namespace
 
 bool GraphicContext::CreateAllocator() {
 	KYTY_PROFILER_FUNCTION();
@@ -42,6 +61,17 @@ bool GraphicContext::CreateAllocator() {
 	info.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
 	if (memory_budget_ext_enabled) {
 		info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
+	}
+	if (const char* value = std::getenv("KYTY_VMA_BLOCK_MB"); value != nullptr && *value != '\0') {
+		const auto block_mb = std::strtoull(value, nullptr, 10);
+		if (block_mb != 0) {
+			info.preferredLargeHeapBlockSize = static_cast<VkDeviceSize>(block_mb) << 20u;
+			LOGF("KYTY_VMA_BLOCK_MB: VMA block size %" PRIu64 " MB\n",
+			     static_cast<uint64_t>(block_mb));
+		}
+	} else if (HasConstrainedDeviceLocalHeap(*this)) {
+		info.preferredLargeHeapBlockSize = 64ull << 20u;
+		LOGF("VMA: using 64 MB large heap blocks for <= 8 GB discrete GPU\n");
 	}
 
 	const auto result = static_cast<vk::Result>(vmaCreateAllocator(&info, &allocator));

@@ -581,7 +581,47 @@ public:
 	// Tracker protections only read m_mapped; the page tracker orders them per page.
 	bool ProtectTransient(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		std::shared_lock state(g_memory_state_mutex);
-		return ProtectMappedUnlocked(vaddr, size, mode);
+		return ProtectMappedUnlocked(vaddr, size, mode, true);
+	}
+
+	void AddLiveStack(uint64_t vaddr, uint64_t size) {
+		if (size == 0 || UINT64_MAX - vaddr < size + HostPageSize()) {
+			return;
+		}
+		const auto      start = AlignDown(vaddr, HostPageSize());
+		const auto      end   = AlignUp(vaddr + size, HostPageSize());
+		std::lock_guard state(g_memory_state_mutex);
+		m_live_stacks.emplace(start, end);
+		auto it = m_mapped.upper_bound(start);
+		if (it != m_mapped.begin()) {
+			--it;
+		}
+		for (; it != m_mapped.end() && it->second.vaddr < end; ++it) {
+			const auto& region      = it->second;
+			const auto  range_start = std::max(start, region.vaddr);
+			const auto  range_end   = std::min(end, region.vaddr + region.size);
+			if (region.type == MappingType::Backing && range_start < range_end) {
+				(void)VirtualMemory::Protect(range_start, range_end - range_start,
+				                             VirtualMemory::Mode::ReadWrite);
+			}
+		}
+	}
+
+	bool RemoveLiveStack(uint64_t vaddr, uint64_t size) {
+		if (size == 0 || UINT64_MAX - vaddr < size + HostPageSize()) {
+			return false;
+		}
+		const auto      start = AlignDown(vaddr, HostPageSize());
+		const auto      end   = AlignUp(vaddr + size, HostPageSize());
+		std::lock_guard state(g_memory_state_mutex);
+		const auto [first, last] = m_live_stacks.equal_range(start);
+		for (auto it = first; it != last; ++it) {
+			if (it->second == end) {
+				m_live_stacks.erase(it);
+				return true;
+			}
+		}
+		return false;
 	}
 
 	bool MapBacking(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
@@ -736,6 +776,7 @@ private:
 	};
 
 	static constexpr uint64_t PageSize() { return 0x4000; }
+	static constexpr uint64_t HostPageSize() { return 0x1000; }
 
 	static uint64_t AlignUp(uint64_t value, uint64_t alignment) {
 		const auto remainder = value % alignment;
@@ -750,7 +791,8 @@ private:
 		return (value & (PageSize() - 1u)) == 0;
 	}
 
-	bool ProtectMappedUnlocked(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+	bool ProtectMappedUnlocked(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
+	                           bool backing_only = false) {
 		const auto end = vaddr + size;
 		auto       it  = m_mapped.upper_bound(vaddr);
 		if (it != m_mapped.begin()) {
@@ -760,7 +802,26 @@ private:
 			const auto& region      = it->second;
 			const auto  range_start = std::max(vaddr, region.vaddr);
 			const auto  range_end   = std::min(end, region.vaddr + region.size);
+			if (backing_only && region.type != MappingType::Backing) {
+				if (range_start < range_end) {
+					static std::atomic<uint32_t> reported {0};
+					if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+						LOGF("Page tracking: left the protection of private memory at "
+						     "0x%016" PRIx64 "+0x%" PRIx64 " alone (a GPU buffer over it)\n",
+						     range_start, range_end - range_start);
+					}
+				}
+				continue;
+			}
 			if (range_start >= range_end) {
+				continue;
+			}
+			const bool mode_is_writable =
+			    (static_cast<uint32_t>(mode) & static_cast<uint32_t>(VirtualMemory::Mode::Write)) != 0;
+			if (backing_only && !m_live_stacks.empty() && !mode_is_writable) {
+				if (!ProtectAroundLiveStacksUnlocked(range_start, range_end, mode)) {
+					return false;
+				}
 				continue;
 			}
 			if (!VirtualMemory::Protect(range_start, range_end - range_start, mode)) {
@@ -768,6 +829,33 @@ private:
 			}
 		}
 		return true;
+	}
+
+	bool ProtectAroundLiveStacksUnlocked(uint64_t start, uint64_t end, VirtualMemory::Mode mode) {
+		auto at = start;
+		for (const auto& [stack_start, stack_end]: m_live_stacks) {
+			if (stack_start >= end) {
+				break;
+			}
+			if (stack_end <= at) {
+				continue;
+			}
+			if (stack_start > at && !VirtualMemory::Protect(at, stack_start - at, mode)) {
+				return false;
+			}
+			static std::atomic<uint32_t> reported {0};
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+				LOGF("Page tracking: left a live thread's stack at 0x%016" PRIx64 "+0x%" PRIx64
+				     " writable (a GPU buffer over it)\n",
+				     std::max(at, stack_start),
+				     std::min(end, stack_end) - std::max(at, stack_start));
+			}
+			at = std::max(at, stack_end);
+			if (at >= end) {
+				return true;
+			}
+		}
+		return VirtualMemory::Protect(at, end - at, mode);
 	}
 
 	bool ConsumeUnlocked(uint64_t vaddr, uint64_t size) {
@@ -1140,6 +1228,7 @@ private:
 
 	std::map<uint64_t, uint64_t>               m_free;
 	std::map<uint64_t, MappedRegion>            m_mapped;
+	std::multimap<uint64_t, uint64_t>          m_live_stacks;
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;
 	uint64_t                                   m_granularity = 0x10000;
 	GuestBackingStore*                         m_backing     = nullptr;

@@ -178,7 +178,13 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	ShaderStageRuntime stage;
 };
 
-enum class ShaderAlphaBlendSource : uint8_t { None, SourceAlpha, SourceAlphaOne, SourceAlphaZero };
+enum class ShaderAlphaBlendSource : uint8_t {
+	None,
+	SourceAlpha,
+	SourceAlphaOne,
+	SourceAlphaZero,
+	OneAlphaZero
+};
 enum class ShaderPixelParameterMode : uint8_t { FirstVertex, LastVertex, Rectangle };
 
 struct ShaderPixelInputInfo {

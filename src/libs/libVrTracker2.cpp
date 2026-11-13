@@ -216,12 +216,22 @@ static int32_t KYTY_SYSV_ABI GetResult(const SceVrTracker2GetResultParam* param,
 	return OK;
 }
 
+static int32_t KYTY_SYSV_ABI SetCoordinateSystem(int32_t coordinate_system) {
+	PRINT_NAME();
+	LOGF("\t coordinate_system = %d\n", coordinate_system);
+	if (!g_initialized.load()) {
+		return ERROR_NOT_INIT;
+	}
+	return OK;
+}
+
 } // namespace VrTracker2
 
 LIB_DEFINE(InitVrTracker2_1) {
 	LIB_FUNC("TwqZnaIjWv4", VrTracker2::QueryMemory);
 	LIB_FUNC("6Jy73SRfG-o", VrTracker2::Initialize);
 	LIB_FUNC("Dog+g25QYjw", VrTracker2::RegisterDevice);
+	LIB_FUNC("UVCMLmS-Eas", VrTracker2::SetCoordinateSystem);
 	LIB_FUNC("J4Vh3VVX0iU", VrTracker2::GetResult);
 }
 

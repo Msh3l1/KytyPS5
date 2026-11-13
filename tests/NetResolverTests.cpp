@@ -1,4 +1,5 @@
 #include "common/abi.h"
+#include "common/emulatorConfig.h"
 #include "libs/errno.h"
 #include "libs/network.h"
 #include "loader/symbolDatabase.h"
@@ -8,9 +9,13 @@
 #include <cstdint>
 #include <cstring>
 
-namespace Libs::LibNet {
+namespace Libs {
+void InitNet_1(Loader::SymbolDatabase *symbols);
+void InitVrTracker2_1(Loader::SymbolDatabase *symbols);
+namespace LibNet {
 void InitNet_1_Net(Loader::SymbolDatabase *symbols);
-}
+} // namespace LibNet
+} // namespace Libs
 
 namespace {
 
@@ -26,18 +31,23 @@ using StartNtoaMultipleRecords = int(KYTY_SYSV_ABI *)(int, const char *,
 class NetResolverTest : public testing::Test {
 protected:
   void SetUp() override {
+    Config::Initialize();
+    Config::Load(Config::ConfigOptions{});
     Libs::LibNet::InitNet_1_Net(&symbols);
     ntoa = Function<StartNtoa>("Nd91WaWmG2w");
     multiple = Function<StartNtoaMultipleRecords>("RCCY01Xd+58");
     ASSERT_NE(ntoa, nullptr);
     ASSERT_NE(multiple, nullptr);
     Network::Initialize();
-    rid = Network::Net::NetResolverCreate(
-        "resolver", Network::Net::NetPoolCreate("net", 0x10000, 0), 0);
+    pool_id = Network::Net::NetPoolCreate("net", 0x10000, 0);
+    rid = Network::Net::NetResolverCreate("resolver", pool_id, 0);
     ASSERT_GE(rid, 0);
   }
 
-  void TearDown() override { Network::Shutdown(); }
+  void TearDown() override {
+    Network::Shutdown();
+    Config::Shutdown();
+  }
 
   template <typename T> T Function(const char *nid) const {
     const auto *record = symbols.FindByNid(nid, Loader::SymbolType::Func);
@@ -47,8 +57,15 @@ protected:
   Loader::SymbolDatabase symbols;
   StartNtoa ntoa = nullptr;
   StartNtoaMultipleRecords multiple = nullptr;
+  int pool_id = -1;
   int rid = -1;
 };
+
+TEST_F(NetResolverTest, UnnamedResolverIsAllowed) {
+  const int unnamed_rid = Network::Net::NetResolverCreate(nullptr, pool_id, 0);
+  ASSERT_GE(unnamed_rid, 0);
+  EXPECT_EQ(Network::Net::NetResolverDestroy(unnamed_rid), 0);
+}
 
 TEST_F(NetResolverTest, MultipleRecordsStoresAddressLiteral) {
   NetResolverInfo info;
@@ -63,16 +80,10 @@ TEST_F(NetResolverTest, MultipleRecordsStoresAddressLiteral) {
   EXPECT_EQ(std::memcmp(&info, &expected, sizeof(info)), 0);
 }
 
-TEST_F(NetResolverTest, MultipleRecordsResolvesHostName) {
+TEST_F(NetResolverTest, MultipleRecordsReturnsEnodnsWhenOffline) {
   NetResolverInfo info{};
-  ASSERT_EQ(multiple(rid, "localhost", &info, 0, 0, 0), 0);
-  ASSERT_GE(info.records, 1);
-  EXPECT_LE(info.records, 10);
-  EXPECT_GE(info.dns4records, info.records);
-  EXPECT_EQ(info.addrs[0].addr, 0x0100007fu);
-  for (int i = 0; i < info.records; i++) {
-    EXPECT_EQ(info.addrs[i].af, 2);
-  }
+  EXPECT_EQ(multiple(rid, "localhost", &info, 0, 0, 0),
+            Network::NET_ERROR_RESOLVER_ENODNS);
 }
 
 TEST_F(NetResolverTest, MultipleRecordsRejectsBadArguments) {
@@ -84,12 +95,12 @@ TEST_F(NetResolverTest, MultipleRecordsRejectsBadArguments) {
             Network::NET_ERROR_EBADF);
 }
 
-TEST_F(NetResolverTest, NtoaStoresFirstAddress) {
+TEST_F(NetResolverTest, NtoaStoresAddressLiteralAndFailsHostnameOffline) {
   uint32_t addr = 0;
   ASSERT_EQ(ntoa(rid, "10.1.2.3", &addr, 0, 0, 0), 0);
   EXPECT_EQ(addr, 0x0302010au);
-  ASSERT_EQ(ntoa(rid, "localhost", &addr, 0, 0, 0), 0);
-  EXPECT_EQ(addr, 0x0100007fu);
+  EXPECT_EQ(ntoa(rid, "localhost", &addr, 0, 0, 0),
+            Network::NET_ERROR_RESOLVER_ENODNS);
 }
 
 TEST_F(NetResolverTest, SocketReuseAddressOption) {
@@ -103,6 +114,18 @@ TEST_F(NetResolverTest, SocketReuseAddressOption) {
   EXPECT_EQ(Network::Net::Getsockopt(s, 0xffff, 0x4, &value, &length), 0);
   EXPECT_NE(value, 0);
   EXPECT_EQ(Network::Net::SocketClose(s), 0);
+}
+
+TEST_F(NetResolverTest, Gt7NetworkAndVrTrackerNidsResolve) {
+  Loader::SymbolDatabase all_symbols;
+  Libs::InitNet_1(&all_symbols);
+  Libs::InitVrTracker2_1(&all_symbols);
+  for (const char *nid : {"UVCMLmS-Eas", "KWkc6Q3tjXc", "lxtHJMwBsaU",
+                          "PM3IZCw-7m0", "aBuX0PX-T7I", "r8mVMwlafF8"}) {
+    const auto *record = all_symbols.FindByNid(nid, Loader::SymbolType::Func);
+    ASSERT_NE(record, nullptr) << "Missing NID: " << nid;
+    EXPECT_NE(record->vaddr, 0u) << "Null address for NID: " << nid;
+  }
 }
 
 } // namespace

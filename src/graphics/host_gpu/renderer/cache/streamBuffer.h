@@ -70,9 +70,12 @@ public:
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
 
 	// BufferCache state lives directly on the resource.
-	bool   is_deleted   = false;
-	int    stream_score = 0;
-	size_t lru_id       = 0;
+	bool     is_deleted    = false;
+	bool     gc_pending    = false;
+	bool     gc_reused     = false;
+	int      stream_score  = 0;
+	size_t   lru_id        = 0;
+	uint64_t last_use_tick = 0;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }

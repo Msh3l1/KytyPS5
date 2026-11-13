@@ -14,9 +14,11 @@
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -25,6 +27,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -205,6 +208,8 @@ public:
 	const ShaderModule* GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                      ShaderComputeInputInfo&      input_info);
 
+	Pipeline* TryGetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,
+	                                 const DrawTargets& targets);
 	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,
 	                              const DrawTargets& targets);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
@@ -217,7 +222,8 @@ private:
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::vector<ShaderModule>                    modules;
+		// Pointer stability matters: async pipeline workers read ShaderModule* after more variants load.
+		std::deque<ShaderModule>                     modules;
 		bool                                         skip_dispatch = false;
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
@@ -245,6 +251,16 @@ private:
 		std::size_t operator()(const GraphicsPipelineKey& key) const;
 	};
 
+	struct AsyncPipelineJob {
+		GraphicsPipelineKey                key {};
+		std::array<const ShaderModule*, 4> stages {};
+	};
+
+	struct CompletedPipeline {
+		GraphicsPipelineKey key {};
+		Pipeline            pipeline {};
+	};
+
 	using ModuleMap = std::unordered_map<uint64_t, const ShaderModule*>;
 
 	GraphicContext&                        m_graphics;
@@ -260,8 +276,17 @@ private:
 	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;
 	std::unordered_map<uint64_t, Pipeline>                                     m_compute_pipelines;
 	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts;
+	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash>           m_async_inflight;
+	std::mutex                                                                 m_async_mutex;
+	std::condition_variable                                                    m_async_cv;
+	std::condition_variable                                                    m_async_done_cv;
+	std::queue<AsyncPipelineJob>                                               m_async_jobs;
+	std::vector<CompletedPipeline>                                             m_async_completed;
+	std::atomic<bool>                                                          m_async_has_completed {false};
+	bool                                                                       m_async_stopping = false;
 	// Records everything first created if a shader store is open, and writes the driver cache.
-	ShaderStoreWriter m_store;
+	ShaderStoreWriter          m_store;
+	std::vector<std::jthread>  m_async_workers;
 
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
@@ -270,6 +295,15 @@ private:
 	                            ShaderRecompiler::CompileOptions  options,
 	                            ShaderRecompiler::TranslateResult translated,
 	                            uint32_t                          push_data_cursor);
+	void BuildGraphicsPipelineKey(const CommandBuffer& command, const DrawRenderState& state,
+	                              const DrawTargets& targets, GraphicsPipelineKey& key,
+	                              std::array<const ShaderModule*, 4>& stages) const;
+	Pipeline& CreateGraphicsPipelineSync(const GraphicsPipelineKey&                key,
+	                                     const std::array<const ShaderModule*, 4>& stages,
+	                                     const DrawRenderState&                    state);
+	void EnsureAsyncWorkers();
+	void DrainCompletedPipelines();
+	void FinishAsyncCompilation();
 	void InitializeDriverCache();
 	// Marks the driver cache changed and, once per interval, has the store thread write it.
 	void CheckpointDriverCache();

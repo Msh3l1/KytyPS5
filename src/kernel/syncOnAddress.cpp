@@ -1,15 +1,21 @@
 #include "kernel/syncOnAddress.h"
 
+#include "common/logging/log.h"
 #include "common/threads.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
+#include <cinttypes>
 #include <climits>
 #include <cstdint>
+#include <cstdlib>
 #include <list>
 #include <memory>
 #include <mutex>
+#include <string_view>
 #include <unordered_map>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
@@ -17,6 +23,22 @@
 #include <linux/futex.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#endif
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h> // IWYU pragma: keep
+#undef min
+#undef max
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+#endif
+
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
 #endif
 
 namespace Libs::LibKernel::SyncOnAddress {
@@ -138,8 +160,108 @@ int WakeLinux(volatile void* address, int32_t count) {
 
 struct PortableWaiter {
 	Common::CondVar condition;
-	bool            wake_requested = false;
+	std::atomic<bool> wake_requested {false};
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	HANDLE            event = nullptr;
+	Clock::time_point woken_at {};
+#endif
 };
+
+struct WaitStats {
+	std::atomic<uint64_t>                waits {0};
+	std::atomic<uint64_t>                at_once {0};
+	std::atomic<uint64_t>                spun {0};
+	std::atomic<uint64_t>                slept {0};
+	std::atomic<uint64_t>                timed_out {0};
+	std::atomic<uint64_t>                wakes {0};
+	std::atomic<uint64_t>                woken {0};
+	std::atomic<uint64_t>                latency_n {0};
+	std::atomic<uint64_t>                latency_us {0};
+	std::atomic<uint64_t>                latency_max {0};
+	std::array<std::atomic<uint64_t>, 5> latency_buckets {};
+	std::atomic<int64_t>                 last_report_ns {0};
+};
+WaitStats g_stats;
+
+int64_t NowNs() {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch())
+	    .count();
+}
+
+[[maybe_unused]] void NoteLatency(uint64_t us) {
+	g_stats.latency_n.fetch_add(1, std::memory_order_relaxed);
+	g_stats.latency_us.fetch_add(us, std::memory_order_relaxed);
+	auto longest = g_stats.latency_max.load(std::memory_order_relaxed);
+	while (us > longest &&
+	       !g_stats.latency_max.compare_exchange_weak(longest, us, std::memory_order_relaxed)) {
+	}
+	const size_t bucket = us < 10 ? 0 : us < 50 ? 1 : us < 200 ? 2 : us < 1000 ? 3 : 4;
+	g_stats.latency_buckets[bucket].fetch_add(1, std::memory_order_relaxed);
+}
+
+void MaybeReport() {
+	const auto now  = NowNs();
+	auto       last = g_stats.last_report_ns.load(std::memory_order_relaxed);
+	if (last == 0) {
+		(void)g_stats.last_report_ns.compare_exchange_strong(last, now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - last < 10'000'000'000 ||
+	    !g_stats.last_report_ns.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+		return;
+	}
+	const auto take = [](std::atomic<uint64_t>& value) {
+		return value.exchange(0, std::memory_order_relaxed);
+	};
+	const auto              waits     = take(g_stats.waits);
+	const auto              at_once   = take(g_stats.at_once);
+	const auto              spun      = take(g_stats.spun);
+	const auto              slept     = take(g_stats.slept);
+	const auto              timed_out = take(g_stats.timed_out);
+	const auto              wakes     = take(g_stats.wakes);
+	const auto              woken     = take(g_stats.woken);
+	const auto              n         = take(g_stats.latency_n);
+	const auto              total_us  = take(g_stats.latency_us);
+	const auto              longest   = take(g_stats.latency_max);
+	std::array<uint64_t, 5> buckets {};
+	for (size_t i = 0; i < buckets.size(); i++) {
+		buckets[i] = take(g_stats.latency_buckets[i]);
+	}
+	if (waits == 0 && wakes == 0) {
+		return;
+	}
+	const double seconds = static_cast<double>(now - last) / 1e9;
+	LOGF("Sync on address (%.1f s): %" PRIu64 " waits (%" PRIu64
+	     " found the value changed, %" PRIu64 " released while spinning, %" PRIu64
+	     " slept, %" PRIu64 " timed out), %" PRIu64 " wakes releasing %" PRIu64
+	     "; a sleeper a wake released returned %.1f us after it on "
+	     "average (%" PRIu64 " measured: %" PRIu64 " under 10 us, %" PRIu64 " under 50, %" PRIu64
+	     " under 200, %" PRIu64 " under 1000, %" PRIu64 " more; longest %" PRIu64 " us)\n",
+	     seconds, waits, at_once, spun, slept, timed_out, wakes, woken,
+	     n != 0 ? static_cast<double>(total_us) / static_cast<double>(n) : 0.0, n, buckets[0],
+	     buckets[1], buckets[2], buckets[3], buckets[4], longest);
+}
+
+[[maybe_unused]] uint32_t SpinMicros() {
+	static const uint32_t micros = [] {
+		const char* value = std::getenv("KYTY_SYNC_SPIN_US");
+		return value != nullptr && *value != '\0' ? static_cast<uint32_t>(std::min<unsigned long>(
+		                                                std::strtoul(value, nullptr, 10), 1000ul))
+		                                          : 20u;
+	}();
+	return micros;
+}
+
+std::atomic<bool> g_old_waits {[] {
+	const char* value = std::getenv("KYTY_SYNC_WAIT");
+	return value != nullptr && std::string_view(value) == "old";
+}()};
+
+[[maybe_unused]] void Pause() {
+#if defined(_M_X64) || defined(__x86_64__)
+	_mm_pause();
+#endif
+}
 
 struct PortableAddressEntry {
 	Common::Mutex              mutex;
@@ -151,13 +273,13 @@ struct PortableAddressRegistry {
 	std::unordered_map<uintptr_t, std::shared_ptr<PortableAddressEntry>> entries;
 };
 
-PortableAddressRegistry& GetPortableRegistry() {
+[[maybe_unused]] PortableAddressRegistry& GetPortableRegistry() {
 	static PortableAddressRegistry registry;
 	return registry;
 }
 
-std::shared_ptr<PortableAddressEntry> RegisterPortableWaiter(volatile void*  address,
-                                                             PortableWaiter* waiter) {
+[[maybe_unused]] std::shared_ptr<PortableAddressEntry> RegisterPortableWaiter(
+    volatile void* address, PortableWaiter* waiter) {
 	auto&           registry = GetPortableRegistry();
 	std::lock_guard registry_lock(registry.mutex);
 	auto&           entry = registry.entries[reinterpret_cast<uintptr_t>(address)];
@@ -169,9 +291,9 @@ std::shared_ptr<PortableAddressEntry> RegisterPortableWaiter(volatile void*  add
 	return entry;
 }
 
-void UnregisterPortableWaiter(volatile void*                               address,
-                              const std::shared_ptr<PortableAddressEntry>& entry,
-                              PortableWaiter*                              waiter) {
+[[maybe_unused]] void UnregisterPortableWaiter(volatile void*                               address,
+                                               const std::shared_ptr<PortableAddressEntry>& entry,
+                                               PortableWaiter*                              waiter) {
 	entry->waiters.remove(waiter);
 	const bool empty = entry->waiters.empty();
 	entry->mutex.Unlock();
@@ -190,8 +312,8 @@ void UnregisterPortableWaiter(volatile void*                               addre
 }
 
 template <typename T>
-int WaitPortable(volatile T* address, T expected, const WaitDeadline& deadline,
-                 signal_poll_func_t signal_poll) {
+int WaitCondVar(volatile T* address, T expected, const WaitDeadline& deadline,
+                signal_poll_func_t signal_poll) {
 	PortableWaiter waiter;
 	auto           entry      = RegisterPortableWaiter(address, &waiter);
 	bool           first_wait = true;
@@ -221,8 +343,146 @@ int WaitPortable(volatile T* address, T expected, const WaitDeadline& deadline,
 		first_wait = false;
 	}
 
+	if (result == KERNEL_ERROR_ETIMEDOUT) {
+		g_stats.timed_out.fetch_add(1, std::memory_order_relaxed);
+	}
 	UnregisterPortableWaiter(address, entry, &waiter);
 	return result;
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+struct ThreadWaitHandles {
+	HANDLE event = nullptr;
+	HANDLE timer = nullptr;
+	ThreadWaitHandles() {
+		event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+		timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+		                               TIMER_ALL_ACCESS);
+		if (timer == nullptr) {
+			timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
+		}
+	}
+	~ThreadWaitHandles() {
+		if (event != nullptr) {
+			CloseHandle(event);
+		}
+		if (timer != nullptr) {
+			CloseHandle(timer);
+		}
+	}
+	ThreadWaitHandles(const ThreadWaitHandles&)            = delete;
+	ThreadWaitHandles& operator=(const ThreadWaitHandles&) = delete;
+};
+
+ThreadWaitHandles& WaitHandles() {
+	thread_local ThreadWaitHandles handles;
+	return handles;
+}
+
+void SleepOnEvent(const ThreadWaitHandles& handles, uint32_t micros, bool precise) {
+	if (precise && handles.timer != nullptr) {
+		LARGE_INTEGER due {};
+		due.QuadPart = -static_cast<LONGLONG>(micros) * 10;
+		if (SetWaitableTimerEx(handles.timer, &due, 0, nullptr, nullptr, nullptr, 0) != 0) {
+			const HANDLE both[2] = {handles.event, handles.timer};
+			(void)WaitForMultipleObjects(2, both, FALSE, INFINITE);
+			return;
+		}
+	}
+	(void)WaitForSingleObject(handles.event, std::max<DWORD>(1, (micros + 999u) / 1000u));
+}
+
+template <typename T>
+int WaitEvent(volatile T* address, T expected, const WaitDeadline& deadline,
+              signal_poll_func_t signal_poll) {
+	if (deadline.finite && Clock::now() >= deadline.end) {
+		if (ReadWord(address) != expected) {
+			return OK;
+		}
+		g_stats.timed_out.fetch_add(1, std::memory_order_relaxed);
+		return KERNEL_ERROR_ETIMEDOUT;
+	}
+	auto& handles = WaitHandles();
+	if (handles.event == nullptr) {
+		return WaitCondVar(address, expected, deadline, signal_poll);
+	}
+	(void)ResetEvent(handles.event);
+	PortableWaiter waiter;
+	waiter.event = handles.event;
+	auto entry   = RegisterPortableWaiter(address, &waiter);
+	int  result  = OK;
+
+	if (const auto spin = SpinMicros(); spin != 0 && ReadWord(address) == expected) {
+		entry->mutex.Unlock();
+		const auto spin_end = Clock::now() + std::chrono::microseconds(spin);
+		bool       released = false;
+		for (uint32_t i = 1;; i++) {
+			if (ReadWord(address) != expected ||
+			    waiter.wake_requested.load(std::memory_order_acquire)) {
+				released = true;
+				break;
+			}
+			if ((i & 63u) == 0) {
+				const auto now = Clock::now();
+				if (now >= spin_end || (deadline.finite && now >= deadline.end)) {
+					break;
+				}
+			}
+			Pause();
+		}
+		entry->mutex.Lock();
+		if (released) {
+			g_stats.spun.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+
+	bool slept      = false;
+	bool first_wait = true;
+	while (ReadWord(address) == expected && !waiter.wake_requested) {
+		const auto slice_micros = GetWaitSliceMicros(deadline, first_wait);
+		if (slice_micros == UINT32_MAX || slice_micros == 0) {
+			result = KERNEL_ERROR_ETIMEDOUT;
+			break;
+		}
+		entry->mutex.Unlock();
+		slept = true;
+		SleepOnEvent(handles, slice_micros, deadline.finite);
+		PollSignals(signal_poll);
+		entry->mutex.Lock();
+
+		if (deadline.finite && Clock::now() >= deadline.end && ReadWord(address) == expected &&
+		    !waiter.wake_requested) {
+			result = KERNEL_ERROR_ETIMEDOUT;
+			break;
+		}
+		first_wait = false;
+	}
+	if (slept) {
+		g_stats.slept.fetch_add(1, std::memory_order_relaxed);
+		if (waiter.wake_requested) {
+			const auto us = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() -
+			                                                                      waiter.woken_at)
+			                    .count();
+			NoteLatency(static_cast<uint64_t>(std::max<int64_t>(us, 0)));
+		}
+	}
+	if (result == KERNEL_ERROR_ETIMEDOUT) {
+		g_stats.timed_out.fetch_add(1, std::memory_order_relaxed);
+	}
+	UnregisterPortableWaiter(address, entry, &waiter);
+	return result;
+}
+#endif
+
+template <typename T>
+int WaitPortable(volatile T* address, T expected, const WaitDeadline& deadline,
+                 signal_poll_func_t signal_poll) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (!g_old_waits.load(std::memory_order_relaxed)) {
+		return WaitEvent(address, expected, deadline, signal_poll);
+	}
+#endif
+	return WaitCondVar(address, expected, deadline, signal_poll);
 }
 
 int WakePortable(volatile void* address, int32_t count) {
@@ -242,8 +502,20 @@ int WakePortable(volatile void* address, int32_t count) {
 	int32_t remaining = count;
 	for (auto* waiter: entry->waiters) {
 		if (!waiter->wake_requested) {
-			waiter->wake_requested = true;
+			g_stats.woken.fetch_add(1, std::memory_order_relaxed);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			waiter->woken_at = Clock::now();
+#endif
+			waiter->wake_requested.store(true, std::memory_order_release);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			if (waiter->event != nullptr) {
+				(void)SetEvent(waiter->event);
+			} else {
+				waiter->condition.Signal();
+			}
+#else
 			waiter->condition.Signal();
+#endif
 			if (remaining != INT_MAX && --remaining == 0) {
 				break;
 			}
@@ -259,6 +531,11 @@ int WaitImpl(volatile T* address, T expected, const WaitDeadline& deadline,
 	if (!IsValidWaitAddress(address)) {
 		return KERNEL_ERROR_EINVAL;
 	}
+	g_stats.waits.fetch_add(1, std::memory_order_relaxed);
+	if (ReadWord(address) != expected) {
+		g_stats.at_once.fetch_add(1, std::memory_order_relaxed);
+	}
+	MaybeReport();
 
 	int result = OK;
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
@@ -271,6 +548,14 @@ int WaitImpl(volatile T* address, T expected, const WaitDeadline& deadline,
 }
 
 } // namespace
+
+void SetOldWaits(bool old) {
+	static const bool forced = [] {
+		const char* value = std::getenv("KYTY_SYNC_WAIT");
+		return value != nullptr && std::string_view(value) == "old";
+	}();
+	g_old_waits.store(forced || old, std::memory_order_relaxed);
+}
 
 int Wait32(volatile uint32_t* address, uint32_t expected, const uint32_t* timeout_micros,
            signal_poll_func_t signal_poll) {
@@ -291,6 +576,7 @@ int Wake(volatile void* address, int32_t count) {
 	if (!IsValidWakeAddress(address) || count < 0) {
 		return KERNEL_ERROR_EINVAL;
 	}
+	g_stats.wakes.fetch_add(1, std::memory_order_relaxed);
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 	return WakeLinux(address, count);

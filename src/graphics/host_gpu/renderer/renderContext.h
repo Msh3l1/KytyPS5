@@ -58,6 +58,9 @@ public:
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
+	void               ResyncHostProtection(uint64_t vaddr, uint64_t size) {
+		m_page_manager.ResyncHostProtection(vaddr, size);
+	}
 	void               PrepareBda();
 	void               RunGarbageCollector();
 

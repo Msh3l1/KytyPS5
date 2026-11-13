@@ -69,8 +69,10 @@ static void PrintUsage() {
 	::printf("  --gpu-assisted-validation            Bounds-check shader accesses on the GPU.\n"
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation                  Enable shader validation.\n");
-	::printf("  --shader-cache                       Keep compiled shaders and pipelines between boots.\n");
-	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
+	::printf("  --shader-cache                       Keep compiled shaders and pipelines between boots. Default: on.\n");
+	::printf("  --no-shader-cache                    Disable persistent shader and pipeline cache.\n");
+	::printf("  --tessellation                       Draw tessellation patches. Default: on.\n");
+	::printf("  --no-tessellation                    Skip tessellation patches.\n");
 	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
 	::printf("  --relaxed-shader-float               Native GPU float ops in shaders; faster, can be inaccurate.\n");
 	::printf("  --native-rt                          Use native RT on the GPU.\n");
@@ -97,7 +99,8 @@ static void PrintUsage() {
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 	::printf("  --skip-notice-screen                 Skip startup logos and notices in supported games.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	::printf("  --redzone                            Protect the guest SysV red zone.\n");
+	::printf("  --redzone                            Protect the guest SysV red zone. Default: on.\n");
+	::printf("  --no-redzone                         Disable guest SysV red-zone protection.\n");
 #endif
 	::printf("  --keymap <Control=Input>             DualSense mapping; may be repeated.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
@@ -205,7 +208,9 @@ static constexpr Flag FLAGS[] = {
     {"--gpu-assisted-validation", &ConfigOptions::gpu_assisted_validation_enabled},
     {"--shader-validation", &ConfigOptions::shader_validation_enabled},
     {"--shader-cache", &ConfigOptions::shader_cache_enabled},
+    {"--no-shader-cache", &ConfigOptions::shader_cache_enabled, false},
     {"--tessellation", &ConfigOptions::tessellation_enabled},
+    {"--no-tessellation", &ConfigOptions::tessellation_enabled, false},
     {"--occlusion-queries", &ConfigOptions::occlusion_queries_enabled},
     {"--relaxed-shader-float", &ConfigOptions::relaxed_shader_float},
     {"--native-rt", &ConfigOptions::native_rt},
@@ -224,6 +229,7 @@ static constexpr Flag FLAGS[] = {
     {"--skip-notice-screen", &ConfigOptions::skip_notice_screen},
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
     {"--redzone", &ConfigOptions::red_zone_protection_enabled},
+    {"--no-redzone", &ConfigOptions::red_zone_protection_enabled, false},
 #endif
 };
 

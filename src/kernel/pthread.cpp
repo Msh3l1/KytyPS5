@@ -397,6 +397,8 @@ struct PthreadPrivate {
 	uint64_t              cond_sequence = 0;
 	std::condition_variable cond_cv;
 	std::atomic<uint64_t> pending_signal_mask {0};
+	uint64_t              live_stack_addr = 0;
+	uint64_t              live_stack_size = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	uintptr_t guest_host_gs8;
 	uintptr_t guest_host_gs10;
@@ -3187,6 +3189,16 @@ static void CleanupThread(void* arg) {
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	rt->DeleteTlss(thread->unique_id);
 
+	if (thread->live_stack_size != 0) {
+		uint64_t   marker = 0;
+		const auto here   = reinterpret_cast<uint64_t>(&marker);
+		if (here - thread->live_stack_addr >= thread->live_stack_size) {
+			Memory::RemoveLiveThreadStack(thread->live_stack_addr, thread->live_stack_size);
+		}
+		thread->live_stack_addr = 0;
+		thread->live_stack_size = 0;
+	}
+
 	thread->almost_done = true;
 }
 
@@ -3229,6 +3241,15 @@ static void* RunThread(void* arg) {
 	     reinterpret_cast<uint64_t>(thread->entry), reinterpret_cast<uint64_t>(thread->arg),
 	     reinterpret_cast<uint64_t>(thread->attr->stack_addr),
 	     static_cast<uint64_t>(thread->attr->stack_size));
+
+	thread->live_stack_addr = 0;
+	thread->live_stack_size = 0;
+	if (thread->attr->stack_user && thread->attr->stack_addr != nullptr &&
+	    thread->attr->stack_size != 0) {
+		thread->live_stack_addr = reinterpret_cast<uint64_t>(thread->attr->stack_addr);
+		thread->live_stack_size = thread->attr->stack_size;
+		Memory::AddLiveThreadStack(thread->live_stack_addr, thread->live_stack_size);
+	}
 
 	// NOLINTNEXTLINE(cppcoreguidelines-pro-type-cstyle-cast)
 	pthread_cleanup_push(CleanupThread, thread);

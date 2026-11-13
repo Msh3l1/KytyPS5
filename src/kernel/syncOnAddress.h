@@ -18,6 +18,8 @@ int Wait64(volatile uint64_t* address, uint64_t expected, std::chrono::nanosecon
            signal_poll_func_t signal_poll = nullptr);
 int Wake(volatile void* address, int32_t count);
 
+void SetOldWaits(bool old);
+
 } // namespace Libs::LibKernel::SyncOnAddress
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_KERNEL_SYNC_ON_ADDRESS_H_ */

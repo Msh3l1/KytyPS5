@@ -29,6 +29,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
@@ -582,6 +583,7 @@ void PipelineCache::CheckpointDriverCache() {
 }
 
 void PipelineCache::Save() {
+	FinishAsyncCompilation();
 	m_store.Finish();
 	if (m_driver_cache_dirty) {
 		m_driver_cache_dirty = false;
@@ -792,6 +794,18 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		} else {
 			pixel_info.parameter_mode = ShaderPixelParameterMode::FirstVertex;
 		}
+		// Exports to unbound targets are dead; they need not block the dual-source takeover of
+		// MRT1.
+		const auto target_live = [&](uint32_t slot) {
+			return context.GetRenderTarget(slot).base.addr != 0 &&
+			       render_target_mask_slot(context.GetRenderTargetMask(), slot) != 0;
+		};
+		bool other_targets_free = true;
+		for (uint32_t slot = 1; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+			if (pixel_info.target_output_mode[slot] != 0 && target_live(slot)) {
+				other_targets_free = false;
+			}
+		}
 		const auto& blend = context.GetBlendControl(0);
 		pixel_info.dual_source_blending =
 		    blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
@@ -807,9 +821,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 			pixel_info.target_sint_mask &= ~2u;
 		} else if (blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
 		           pixel_info.target_output_mode[0] != 0 && pixel_info.target_output_mode[0] != 7 &&
-		           std::all_of(std::begin(pixel_info.target_output_mode) + 1,
-		                       std::end(pixel_info.target_output_mode),
-		                       [](uint8_t mode) { return mode == 0; })) {
+		           other_targets_free) {
 			switch (ClassifyBlendMapping(blend, pixel_info.target_export_mapping[0])) {
 				case BlendMappingSupport::SourceAlpha:
 					pixel_info.alpha_blend_source = ShaderAlphaBlendSource::SourceAlpha;
@@ -820,9 +832,15 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 				case BlendMappingSupport::SourceAlphaZero:
 					pixel_info.alpha_blend_source = ShaderAlphaBlendSource::SourceAlphaZero;
 					break;
+				case BlendMappingSupport::OneAlphaZero:
+					pixel_info.alpha_blend_source = ShaderAlphaBlendSource::OneAlphaZero;
+					break;
 				default: break;
 			}
 			if (pixel_info.alpha_blend_source != ShaderAlphaBlendSource::None) {
+				for (uint32_t slot = 2; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+					pixel_info.target_output_mode[slot] = 0;
+				}
 				pixel_info.dual_source_blending     = true;
 				pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
 				pixel_info.target_export_mapping[1] = {};
@@ -879,19 +897,20 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 	return GetProgram(params, input_info, push_data_cursor);
 }
 
-PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
-                                                            const DrawRenderState& state,
-                                                            const DrawTargets&     targets) {
+void PipelineCache::BuildGraphicsPipelineKey(const CommandBuffer&              command,
+                                             const DrawRenderState&            state,
+                                             const DrawTargets&                targets,
+                                             GraphicsPipelineKey&              key,
+                                             std::array<const ShaderModule*, 4>& stages) const {
 	const auto* colors        = targets.colors;
 	const auto& depth         = targets.depth;
 	const auto  vertex_info   = state.VertexStages();
 	const auto& ps_input_info = state.ps_input_info;
 	const auto& vs_input_info = vertex_info.front();
-	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
 
 	const bool ps_active    = state.ps_active;
 	const bool tessellation = vertex_info.size() == 3;
-	std::array<const ShaderModule*, 4> stages {};
+	stages                  = {};
 	for (uint32_t i = 0; i < vertex_info.size(); i++) {
 		stages[i] = vertex_info[i].stage.module;
 	}
@@ -905,7 +924,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 
 	const HW::ModeControl& mc = ctx.GetModeControl();
 
-	GraphicsPipelineKey key {};
+	key = {};
 	for (uint32_t i = 0; i < stages.size(); i++) {
 		if (stages[i] != nullptr) {
 			key.stage_ids[i] = stages[i]->id;
@@ -965,6 +984,15 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 					blend.color_destblend =
 					    static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Alpha);
 					blend.separate_alpha_blend = false;
+					break;
+				case ShaderAlphaBlendSource::OneAlphaZero:
+					// MRT1 supplies physical factors (1.0 RGB, 0.0 A) for separate alpha blending.
+					blend.color_srcblend  = static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Color);
+					blend.color_destblend = RemapSourceAlphaFactor(blend.color_destblend);
+					blend.alpha_srcblend  = static_cast<uint8_t>(Prospero::BlendFactor::kOne);
+					blend.alpha_destblend = RemapSourceAlphaFactor(bc.color_destblend);
+					blend.alpha_comb_fcn  = bc.color_comb_fcn;
+					blend.separate_alpha_blend = true;
 					break;
 				case ShaderAlphaBlendSource::None: break;
 			}
@@ -1047,7 +1075,11 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 			};
 		}
 	}
+}
 
+PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipelineSync(
+    const GraphicsPipelineKey& key, const std::array<const ShaderModule*, 4>& stages,
+    const DrawRenderState& state) {
 	auto [iter, inserted] = m_graphics_pipelines.try_emplace(key);
 	auto& pipeline        = iter->second;
 	if (!inserted) {
@@ -1055,9 +1087,9 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	}
 
 	if (graphics_debug_dump_enabled()) {
-		ShaderDbgDumpInputInfo(vs_input_info);
-		if (ps_active) {
-			ShaderDbgDumpInputInfo(ps_input_info);
+		ShaderDbgDumpInputInfo(state.VertexStages().front());
+		if (state.ps_active) {
+			ShaderDbgDumpInputInfo(state.ps_input_info);
 		}
 	}
 
@@ -1071,6 +1103,171 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	CheckpointDriverCache();
 
 	return pipeline;
+}
+
+void PipelineCache::EnsureAsyncWorkers() {
+	if (!m_async_workers.empty() || m_async_stopping) {
+		return;
+	}
+	const uint32_t hw    = std::max(1u, std::thread::hardware_concurrency());
+	uint32_t       count = std::clamp(hw / 2u, 2u, 16u);
+	if (const char* env = std::getenv("KYTY_ASYNC_PIPELINE_THREADS")) {
+		const auto parsed = std::strtoul(env, nullptr, 10);
+		if (parsed > 0) {
+			count = std::min<uint32_t>(static_cast<uint32_t>(parsed), 32u);
+		}
+	}
+	m_async_workers.reserve(count);
+	for (uint32_t i = 0; i < count; i++) {
+		m_async_workers.emplace_back([this](std::stop_token stop) {
+			for (;;) {
+				AsyncPipelineJob job;
+				{
+					std::unique_lock lock(m_async_mutex);
+					m_async_cv.wait(lock, [this, &stop] {
+						return stop.stop_requested() || m_async_stopping || !m_async_jobs.empty();
+					});
+					if (stop.stop_requested() || (m_async_stopping && m_async_jobs.empty())) {
+						return;
+					}
+					job = std::move(m_async_jobs.front());
+					m_async_jobs.pop();
+				}
+				Pipeline pipeline {};
+				{
+					Common::DebugCounters::ScopedTimer timer(
+					    Common::DebugCounters::Counter::PipelinesCreated,
+					    Common::DebugCounters::Counter::PipelineCreateNs,
+					    Common::DebugCounters::Peak::PipelineCreateNs);
+					CreatePipelineInternal(m_graphics, pipeline, job.key, job.stages,
+					                       m_driver_cache);
+				}
+				{
+					std::scoped_lock lock(m_async_mutex);
+					m_async_completed.push_back({job.key, pipeline});
+					m_async_has_completed.store(true, std::memory_order_release);
+				}
+				m_async_done_cv.notify_all();
+			}
+		});
+	}
+}
+
+void PipelineCache::DrainCompletedPipelines() {
+	if (!m_async_has_completed.load(std::memory_order_acquire)) {
+		return;
+	}
+	std::vector<CompletedPipeline> completed;
+	{
+		std::scoped_lock lock(m_async_mutex);
+		completed.swap(m_async_completed);
+		m_async_has_completed.store(false, std::memory_order_release);
+	}
+	for (const auto& item: completed) {
+		m_async_inflight.erase(item.key);
+		const auto [iter, inserted] = m_graphics_pipelines.try_emplace(item.key, item.pipeline);
+		if (inserted) {
+			StorePipeline(item.key);
+			CheckpointDriverCache();
+		} else {
+			m_graphics.device.destroyPipeline(item.pipeline.pipeline, nullptr);
+			m_graphics.device.destroyPipelineLayout(item.pipeline.pipeline_layout, nullptr);
+			m_graphics.device.destroyDescriptorSetLayout(item.pipeline.descriptor_set_layout,
+			                                             nullptr);
+		}
+	}
+}
+
+void PipelineCache::FinishAsyncCompilation() {
+	{
+		std::scoped_lock             lock(m_async_mutex);
+		m_async_stopping = true;
+		std::queue<AsyncPipelineJob> empty;
+		m_async_jobs.swap(empty);
+	}
+	m_async_cv.notify_all();
+	m_async_done_cv.notify_all();
+	m_async_workers.clear();
+	DrainCompletedPipelines();
+	m_async_inflight.clear();
+}
+
+PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(const CommandBuffer&   command,
+                                                               const DrawRenderState& state,
+                                                               const DrawTargets&     targets) {
+	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
+	std::array<const ShaderModule*, 4> stages {};
+	GraphicsPipelineKey                key {};
+	BuildGraphicsPipelineKey(command, state, targets, key, stages);
+
+	if (const auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+		return &iter->second;
+	}
+
+	DrainCompletedPipelines();
+	if (const auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+		return &iter->second;
+	}
+
+	if (m_async_inflight.contains(key)) {
+		return nullptr;
+	}
+
+	static const bool async_enabled = [] {
+		const char* env = std::getenv("KYTY_ASYNC_PIPELINES");
+		return env == nullptr || env[0] != '0';
+	}();
+	if (!async_enabled || m_async_stopping) {
+		return &CreateGraphicsPipelineSync(key, stages, state);
+	}
+
+	EnsureAsyncWorkers();
+	if (graphics_debug_dump_enabled()) {
+		ShaderDbgDumpInputInfo(state.VertexStages().front());
+		if (state.ps_active) {
+			ShaderDbgDumpInputInfo(state.ps_input_info);
+		}
+	}
+	m_async_inflight.insert(key);
+	{
+		std::scoped_lock lock(m_async_mutex);
+		m_async_jobs.push({key, stages});
+	}
+	m_async_cv.notify_one();
+	return nullptr;
+}
+
+PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
+                                                            const DrawRenderState& state,
+                                                            const DrawTargets&     targets) {
+	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
+	std::array<const ShaderModule*, 4> stages {};
+	GraphicsPipelineKey                key {};
+	BuildGraphicsPipelineKey(command, state, targets, key, stages);
+
+	if (const auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+		return iter->second;
+	}
+
+	DrainCompletedPipelines();
+	if (const auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+		return iter->second;
+	}
+
+	while (m_async_inflight.contains(key)) {
+		{
+			std::unique_lock lock(m_async_mutex);
+			m_async_done_cv.wait(lock, [this] {
+				return m_async_has_completed.load(std::memory_order_acquire) || m_async_stopping;
+			});
+		}
+		DrainCompletedPipelines();
+		if (const auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+			return iter->second;
+		}
+	}
+
+	return CreateGraphicsPipelineSync(key, stages, state);
 }
 
 PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info) {

@@ -1741,8 +1741,34 @@ static int KYTY_SYSV_ABI NpSessionSignalingInitialize(void* param) {
 	return 0;
 }
 
+static int KYTY_SYSV_ABI NpSessionSignalingCreateContext2(int ctx_id, void* handler, void* user_arg,
+                                                          int* out_ctx) {
+	PRINT_NAME();
+
+	LOGF("\t ctx_id = %d\n", ctx_id);
+
+	if (out_ctx == nullptr) {
+		return -2141913085; // 0x80550003 SCE_NP_ERROR_INVALID_ARGUMENT
+	}
+
+	static int next_ctx = 1;
+	*out_ctx            = next_ctx++;
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpSessionSignalingRequestPrepare(int ctx_id, int type, const void* param,
+                                                          void* req_id) {
+	PRINT_NAME();
+
+	LOGF("\t ctx_id = %d, type = %d\n", ctx_id, type);
+
+	return 0;
+}
+
 LIB_DEFINE(InitNet_1_NpSessionSignaling) {
 	LIB_FUNC("ysmw6J-P8Ak", NpSessionSignalingInitialize);
+	LIB_FUNC("aBuX0PX-T7I", NpSessionSignalingCreateContext2);
+	LIB_FUNC("r8mVMwlafF8", NpSessionSignalingRequestPrepare);
 }
 
 } // namespace LibNpSessionSignaling
@@ -1949,6 +1975,20 @@ static int KYTY_SYSV_ABI NpAuthPollAsync(int req_id, int* result) {
 	return np_auth_wait_or_poll_async(req_id, result);
 }
 
+static int KYTY_SYSV_ABI NpAuthSetTimeout(int req_id, uint32_t resolve, uint32_t connect,
+                                          uint32_t send, uint32_t recv) {
+	PRINT_NAME();
+
+	LOGF("\t req_id = %d, resolve = %u, connect = %u, send = %u, recv = %u\n", req_id, resolve,
+	     connect, send, recv);
+
+	std::scoped_lock lock(g_np_auth_request_mutex);
+	if (np_auth_find_request(req_id) == nullptr) {
+		return NP_AUTH_ERROR_REQUEST_NOT_FOUND;
+	}
+	return 0;
+}
+
 static int KYTY_SYSV_ABI NpAuthGetAuthorizationCodeV3(
     int req_id, const NpAuthGetAuthorizationCodeParameterV3* param, void* auth_code,
     int* issuer_id) {
@@ -2017,6 +2057,7 @@ LIB_DEFINE(InitNet_1_NpAuth) {
 	LIB_FUNC("cE7wIsqXdZ8", LibNpAuth::NpAuthAbortRequest);
 	LIB_FUNC("SK-S7daqJSE", LibNpAuth::NpAuthWaitAsync);
 	LIB_FUNC("gjSyfzSsDcE", LibNpAuth::NpAuthPollAsync);
+	LIB_FUNC("PM3IZCw-7m0", LibNpAuth::NpAuthSetTimeout);
 	LIB_FUNC("KI4dHLlTNl0", LibNpAuth::NpAuthGetAuthorizationCodeV3);
 	LIB_FUNC("RdsFVsgSpZY", LibNpAuth::NpAuthGetIdTokenV3);
 }
@@ -2457,6 +2498,28 @@ static int KYTY_SYSV_ABI NpWebApi2PushEventUnregisterCallback(int user_context_i
 	return 0;
 }
 
+static int KYTY_SYSV_ABI NpWebApi2PushEventSetHandleTimeout(int lib_ctx_id, int handle_id,
+                                                            uint32_t timeout_ms) {
+	PRINT_NAME();
+
+	LOGF("\t lib_ctx_id = %d\n\t handle_id  = %d\n\t timeout_ms = %" PRIu32 "\n", lib_ctx_id,
+	     handle_id, timeout_ms);
+
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpWebApi2PushEventRegisterPushContextCallback(int user_context_id,
+                                                                         int filter_id,
+                                                                         void* callback,
+                                                                         void* user_arg) {
+	PRINT_NAME();
+
+	LOGF("\t user_context_id = %d\n\t filter_id       = %d\n", user_context_id, filter_id);
+
+	static int callback_id = 1000;
+	return callback_id++;
+}
+
 static void KYTY_SYSV_ABI NpWebApi2CheckTimeout() {
 	// Timeout processing is an internal maintenance tick in Prospero. Requests
 	// complete synchronously in this implementation, so there is no pending
@@ -2479,6 +2542,7 @@ LIB_DEFINE(InitNet_1_NpWebApi2) {
 	LIB_FUNC("+o9816YQhqQ", LibNpWebApi2::NpWebApi2Initialize);
 	LIB_FUNC("Xweb+naPZ8Y", LibNpWebApi2::NpWebApi2GetMemoryPoolStats);
 	LIB_FUNC("WV1GwM32NgY", LibNpWebApi2::NpWebApi2PushEventCreateHandle);
+	LIB_FUNC("KWkc6Q3tjXc", LibNpWebApi2::NpWebApi2PushEventSetHandleTimeout);
 	LIB_FUNC("sk54bi6FtYM", LibNpWebApi2::NpWebApi2CreateUserContext);
 	LIB_FUNC("9X9+cneTGUU", LibNpWebApi2::NpWebApi2DeleteUserContext);
 	LIB_FUNC("3EI-OSJ65Xc", LibNpWebApi2::NpWebApi2CreateRequest);
@@ -2493,6 +2557,7 @@ LIB_DEFINE(InitNet_1_NpWebApi2) {
 	LIB_FUNC("QafxeZM3WK4", LibNpWebApi2::NpWebApi2PushEventDeletePushContext);
 	LIB_FUNC("MsaFhR+lPE4", LibNpWebApi2::NpWebApi2PushEventCreateFilter);
 	LIB_FUNC("fY3QqeNkF8k", LibNpWebApi2::NpWebApi2PushEventRegisterCallback);
+	LIB_FUNC("lxtHJMwBsaU", LibNpWebApi2::NpWebApi2PushEventRegisterPushContextCallback);
 	LIB_FUNC("KJdPcOGmK58", LibNpWebApi2::NpWebApi2PushEventDeleteFilter);
 	LIB_FUNC("hOnIlcGrO6g", LibNpWebApi2::NpWebApi2PushEventUnregisterCallback);
 	LIB_FUNC("3Tt9zL3tkoc", LibNpWebApi2::NpWebApi2CheckTimeout);

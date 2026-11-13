@@ -284,6 +284,37 @@ template void PageManager::UpdatePageWatchers<true, false>(uint64_t, uint64_t);
 template void PageManager::UpdatePageWatchers<false, true>(uint64_t, uint64_t);
 template void PageManager::UpdatePageWatchers<false, false>(uint64_t, uint64_t);
 
+void PageManager::ResyncHostProtection(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid() || vaddr >= ADDRESS_SIZE) {
+		return;
+	}
+	const auto begin = Common::AlignDown(vaddr, PAGE_SIZE);
+	const auto end   = std::min(Common::AlignUp(vaddr + size, PAGE_SIZE), ADDRESS_SIZE);
+	for (auto chunk_begin = begin; chunk_begin < end;) {
+		const auto chunk_end   = std::min(end, Common::AlignUp(chunk_begin + 1, REGION_SIZE));
+		const auto region_base = Common::AlignDown(chunk_begin, REGION_SIZE);
+		const auto first       = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE);
+		const auto last        = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
+		auto*      region      = m_impl->FindRegion(chunk_begin);
+		chunk_begin            = chunk_end;
+		if (region == nullptr) {
+			continue;
+		}
+		SpinGuard lock(region->lock);
+		for (size_t page = first; page < last;) {
+			const auto perms = region->pages[page].Perms();
+			size_t     run   = page + 1;
+			while (run < last && region->pages[run].Perms() == perms) {
+				run++;
+			}
+			if (perms != Common::VirtualMemory::Mode::ReadWrite) {
+				m_impl->Protect(region_base + page * PAGE_SIZE, (run - page) * PAGE_SIZE, perms);
+			}
+			page = run;
+		}
+	}
+}
+
 template <bool track, bool is_read>
 void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask) {
 	const auto start_range = mask.FirstRange();

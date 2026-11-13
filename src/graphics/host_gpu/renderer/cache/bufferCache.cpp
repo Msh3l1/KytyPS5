@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -147,8 +148,12 @@ void BufferCache::ChangeRegister(BufferId id) {
 	}
 }
 
-void BufferCache::TouchBuffer(const Buffer& buffer) {
+void BufferCache::TouchBuffer(Buffer& buffer) {
 	m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
+	buffer.last_use_tick = m_scheduler.CurrentTick();
+	if (buffer.gc_pending) {
+		buffer.gc_reused = true;
+	}
 }
 
 void BufferCache::DeleteBuffer(BufferId id) {
@@ -270,6 +275,15 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	const auto critical  = std::min(budget - 2 * threshold / 10, budget - GiB / 2);
 	m_trigger_gc_memory  = static_cast<uint64_t>(std::max<int64_t>(expected, GiB));
 	m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(critical, 2 * GiB));
+	uint64_t cap_mib = 6144ull;
+	if (const char* env = std::getenv("KYTY_BUFFER_CACHE_MB")) {
+		cap_mib = std::strtoull(env, nullptr, 10);
+	}
+	if (cap_mib > 0) {
+		const uint64_t cap   = cap_mib << 20u;
+		m_trigger_gc_memory  = std::min(m_trigger_gc_memory, cap);
+		m_critical_gc_memory = std::min(m_critical_gc_memory, cap + cap / 4);
+	}
 }
 
 BufferCache::~BufferCache() {
@@ -675,10 +689,17 @@ void BufferCache::RunGarbageCollector() {
 	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
 	const size_t   limit      = aggressive ? 64 : 32;
 
-	std::vector<BufferId> dirty_buffers;
-	size_t                retire_count = 0;
+	struct PendingBuffer {
+		BufferId id;
+		uint64_t address = 0;
+	};
+	std::vector<PendingBuffer> dirty_buffers;
+	size_t                     retire_count = 0;
 	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
+		if (buffer.gc_pending) {
+			return false;
+		}
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
@@ -687,7 +708,7 @@ void BufferCache::RunGarbageCollector() {
 		}
 		if (dirty) {
 			EXIT_NOT_IMPLEMENTED(!DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size()));
-			dirty_buffers.push_back(id);
+			dirty_buffers.push_back({id, buffer.CpuAddress()});
 		} else {
 			m_memory_tracker.MarkRegionAsCpuModified(buffer.CpuAddress(), buffer.Size());
 			DeleteBuffer(id);
@@ -699,16 +720,52 @@ void BufferCache::RunGarbageCollector() {
 		return;
 	}
 
+	const auto        completion_tick = m_scheduler.CurrentTick();
+	const char* const env_async       = std::getenv("KYTY_GC_ASYNC_DOWNLOAD");
+	const bool        async_download  = (env_async == nullptr || env_async[0] != '0') &&
+	                                    m_scheduler.Active();
+	if (async_download) {
+		for (const auto& entry: dirty_buffers) {
+			auto& buffer      = m_slot_buffers[entry.id];
+			buffer.gc_pending = true;
+			buffer.gc_reused  = false;
+		}
+		m_scheduler.DeferOperation([this, completion_tick,
+		                            pending = std::move(dirty_buffers)] {
+			for (const auto& entry: pending) {
+				auto* buffer = m_slot_buffers.try_get(entry.id);
+				if (buffer == nullptr || buffer->is_deleted || !buffer->gc_pending ||
+				    buffer->CpuAddress() != entry.address) {
+					continue;
+				}
+				buffer->gc_pending = false;
+				if (buffer->gc_reused || buffer->last_use_tick > completion_tick ||
+				    m_gpu_modified_ranges.Intersects(buffer->CpuAddress(), buffer->Size())) {
+					buffer->gc_reused = false;
+					continue;
+				}
+				m_memory_tracker.UnmarkRegionAsGpuModified(buffer->CpuAddress(), buffer->Size());
+				if (m_memory_tracker.IsRegionGpuModified(buffer->CpuAddress(), buffer->Size())) {
+					continue;
+				}
+				m_memory_tracker.MarkRegionAsCpuModified(buffer->CpuAddress(), buffer->Size());
+				DeleteBuffer(entry.id);
+				Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferEvictions);
+			}
+		});
+		return;
+	}
+
 	// Publish all queued downloads before releasing their tracked pages and owners.
-	const auto completion_tick = m_scheduler.CurrentTick();
 	m_scheduler.Wait(completion_tick);
 	m_scheduler.WaitPriorityOperations(completion_tick);
-	for (const auto id: dirty_buffers) {
-		auto& buffer = m_slot_buffers[id];
+	for (const auto& entry: dirty_buffers) {
+		auto& buffer = m_slot_buffers[entry.id];
 		m_memory_tracker.UnmarkRegionAsGpuModified(buffer.CpuAddress(), buffer.Size());
 		m_memory_tracker.MarkRegionAsCpuModified(buffer.CpuAddress(), buffer.Size());
-		Unregister(id);
-		m_slot_buffers.erase(id);
+		Unregister(entry.id);
+		m_slot_buffers.erase(entry.id);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferEvictions);
 	}
 }
 

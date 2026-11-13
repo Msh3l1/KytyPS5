@@ -27,6 +27,7 @@ struct RenderDepthInfo {
 	bool                        stencil_test_enable      = false;
 	vk::StencilOpState          stencil_front;
 	vk::StencilOpState          stencil_back;
+	bool                        unsupported              = false;
 	ImageId                     image_id;
 
 	[[nodiscard]] vk::ImageAspectFlags AttachmentWriteAspects() const;

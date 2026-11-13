@@ -21,6 +21,7 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -136,6 +137,16 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		m_critical_gc_memory = static_cast<uint64_t>(
 		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
 		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+		uint64_t cap_mib = 6144ull;
+		if (const char* env = std::getenv("KYTY_TEXTURE_CACHE_MB")) {
+			cap_mib = std::strtoull(env, nullptr, 10);
+		}
+		if (cap_mib > 0) {
+			const uint64_t cap   = cap_mib << 20u;
+			m_pressure_gc_memory = std::min(m_pressure_gc_memory, cap);
+			m_critical_gc_memory = std::min(m_critical_gc_memory, cap + cap / 4);
+			m_trigger_gc_memory  = std::min(m_trigger_gc_memory, (cap / 4) * 3);
+		}
 	}
 }
 
@@ -284,6 +295,7 @@ void TextureCache::FreeImage(ImageId id) {
 void TextureCache::TouchImage(Image& image) {
 	if (image.registered) {
 		m_lru_cache.Touch(image.lru_id, m_gc_tick);
+		image.tick_accessed_last = m_gc_tick;
 	}
 }
 
@@ -1788,7 +1800,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	return true;
 }
 
-bool TextureCache::DownloadImageMemory(ImageId id) {
+bool TextureCache::DownloadImageMemory(ImageId id, std::shared_ptr<std::atomic<bool>>* landed) {
 	auto& image = m_slot_images[id];
 	if (image.depth_id) {
 		return false;
@@ -1828,8 +1840,22 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		}
 		m_page_manager.UpdatePageWatchers<true, true>(range.address, range.size);
 	}
+	std::shared_ptr<std::atomic<bool>> landed_flag;
+	if (landed != nullptr) {
+		landed_flag = std::make_shared<std::atomic<bool>>(false);
+		*landed     = landed_flag;
+	}
 	m_scheduler.DeferPriorityOperation([this, download = std::move(download), range,
-	                                    trapped = m_readback_storage_images] {
+	                                    trapped     = m_readback_storage_images,
+	                                    landed_flag = std::move(landed_flag)] {
+		struct LandedGuard {
+			std::shared_ptr<std::atomic<bool>> flag;
+			~LandedGuard() {
+				if (flag) {
+					flag->store(true, std::memory_order_release);
+				}
+			}
+		} on_exit {landed_flag};
 		download.buffer->Invalidate(download.offset, range.size);
 		LibKernel::Memory::WriteBacking(range.address, download.mapped, range.size);
 		if (trapped) {
@@ -2027,6 +2053,24 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
+	std::erase_if(m_pending_evictions, [this](const PendingEviction& pending) {
+		if (!pending.landed || !pending.landed->load(std::memory_order_acquire)) {
+			return false;
+		}
+		m_evicting.erase(pending.id);
+		auto* image = m_slot_images.try_get(pending.id);
+		if (image == nullptr || !image->registered || image->serial != pending.serial ||
+		    image->info.data.address != pending.address) {
+			return true;
+		}
+		if (image->tick_accessed_last != pending.tick) {
+			return true;
+		}
+		FreeImage(pending.id);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
+		return true;
+	});
+
 	const uint64_t   tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
@@ -2037,13 +2081,13 @@ void TextureCache::RunGarbageCollector() {
 	const auto collect = [&](bool allow_aggressive) {
 		bool     pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool     aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		uint64_t age        = 16;
+		uint64_t age        = 60;
 		size_t   deletions  = 10;
 		if (aggressive) {
-			age       = 160;
+			age       = 4;
 			deletions = 40;
 		} else if (pressured) {
-			age       = 80;
+			age       = 16;
 			deletions = 20;
 		}
 		age = std::min(age, tick);
@@ -2055,17 +2099,35 @@ void TextureCache::RunGarbageCollector() {
 			if (deletions == 0) {
 				break;
 			}
+			if (m_evicting.contains(id)) {
+				continue;
+			}
 			auto owner = m_slot_images.try_get(id);
 			if (owner == nullptr || !owner->registered || owner->depth_id) {
 				continue;
 			}
-			if (owner->heap_refs.load(std::memory_order_relaxed) != 0u) {
-				// Resident heaps sample it without touching it.
-				TouchImage(*owner);
+			if (owner->heap_refs.load(std::memory_order_relaxed) != 0u && !aggressive) {
 				continue;
 			}
-			if (owner->SafeToDownload() &&
-			    (!pressured || owner->info.HasStencil() || !DownloadImageMemory(id))) {
+			if (owner->usage.render_target && owner->info.extent.width <= 1024 &&
+			    owner->info.extent.height <= 1024 && !aggressive) {
+				continue;
+			}
+			if (owner->IsGpuModified()) {
+				std::shared_ptr<std::atomic<bool>> landed;
+				if (!pressured || owner->info.HasStencil() || !owner->SafeToDownload() ||
+				    !DownloadImageMemory(id, &landed)) {
+					continue;
+				}
+				m_evicting.insert(id);
+				m_pending_evictions.push_back({
+				    .id      = id,
+				    .serial  = owner->serial,
+				    .address = owner->info.data.address,
+				    .tick    = owner->tick_accessed_last,
+				    .landed  = std::move(landed),
+				});
+				--deletions;
 				continue;
 			}
 			--deletions;

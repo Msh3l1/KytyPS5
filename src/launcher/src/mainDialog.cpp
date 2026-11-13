@@ -279,10 +279,10 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	AddFlag(args, info.skip_notice_screen, "--skip-notice-screen");
 	AddFlag(args, info.network_connected, "--network-connected");
 	AddFlag(args, info.psn_emulation_enabled, "--emulate-psn");
-	AddFlag(args, info.tessellation_enabled, "--tessellation");
+	AddFlag(args, !info.tessellation_enabled, "--no-tessellation");
 	AddFlag(args, info.occlusion_queries_enabled, "--occlusion-queries");
 	AddFlag(args, info.relaxed_shader_float, "--relaxed-shader-float");
-	AddFlag(args, info.shader_cache_enabled, "--shader-cache");
+	AddFlag(args, !info.shader_cache_enabled, "--no-shader-cache");
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
 	AddFlag(args, info.vulkan_validation_enabled, "--vulkan-validation");
@@ -306,7 +306,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	AddFlag(args, info.amd_cpu_enabled, "--amd-cpu");
 	AddFlag(args, info.guest_tsc_enabled, "--guest-tsc");
 #if defined(_WIN32)
-	AddFlag(args, info.red_zone_protection_enabled, "--redzone");
+	AddFlag(args, !info.red_zone_protection_enabled, "--no-redzone");
 #endif
 	for (const auto& binding: info.host_input_mapping) {
 		args << "--keymap" << binding;

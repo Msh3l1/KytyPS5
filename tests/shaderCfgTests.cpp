@@ -10828,6 +10828,15 @@ void TestBlendMappingClassification() {
     Check(classify(Prospero::ColorMappingAbgr) == Support::Unsupported,
           "separate alpha lowering accepted a different blend equation");
   }
+
+  blend = exact;
+  blend.color_srcblend = static_cast<uint8_t>(Factor::kOne);
+  blend.alpha_srcblend = static_cast<uint8_t>(Factor::kZero);
+  Check(classify(Prospero::ColorMappingAbgr) == Support::OneAlphaZero,
+        "separate one/zero alpha attenuation was not recognized");
+  blend.alpha_destblend = static_cast<uint8_t>(Factor::kOne);
+  Check(classify(Prospero::ColorMappingAbgr) == Support::Unsupported,
+        "OneAlphaZero accepted mismatching alpha destblend");
 }
 
 void TestLogicalAlphaBlendExport() {
@@ -10843,11 +10852,16 @@ void TestLogicalAlphaBlendExport() {
   const auto separate_key = MakeStageStaticKey(pixel);
   pixel.alpha_blend_source = ShaderAlphaBlendSource::SourceAlphaZero;
   const auto zero_key = MakeStageStaticKey(pixel);
+  pixel.alpha_blend_source = ShaderAlphaBlendSource::OneAlphaZero;
+  const auto one_zero_key = MakeStageStaticKey(pixel);
   Check(ordinary_key != guest_key && guest_key != remapped_key &&
             ordinary_key != remapped_key && separate_key != ordinary_key &&
             separate_key != guest_key && separate_key != remapped_key &&
             zero_key != ordinary_key && zero_key != guest_key &&
-            zero_key != remapped_key && zero_key != separate_key,
+            zero_key != remapped_key && zero_key != separate_key &&
+            one_zero_key != ordinary_key && one_zero_key != guest_key &&
+            one_zero_key != remapped_key && one_zero_key != separate_key &&
+            one_zero_key != zero_key,
         "ordinary, guest dual-source, and logical-alpha modes share a cache key");
 
   auto options = MakeCompileOptions(ShaderType::Pixel);
@@ -10909,6 +10923,27 @@ void TestLogicalAlphaBlendExport() {
       Check(unit_alpha_factor == (mode == ShaderAlphaBlendSource::SourceAlphaOne),
             "secondary ABGR output must be (1, Sa, Sa, Sa) only for separate alpha accumulation");
     }
+  }
+
+  {
+    pixel.alpha_blend_source = ShaderAlphaBlendSource::OneAlphaZero;
+    const uint32_t shader[] = {
+        EncodeVop1(0x01, 0, 255), 0x447a0000u,
+        EncodeVop1(0x01, 1, 255), 0x40000000u,
+        EncodeVop1(0x01, 2, 255), 0x40400000u,
+        EncodeVop1(0x01, 3, 255), 0x3e800000u,
+        EncodeExp0(0, 0xf, false, false), EncodeExp1(0, 1, 2, 3),
+        EncodeSopp(0x01),
+    };
+    const auto one_zero = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(one_zero.spirv);
+    const auto source = DisassembleSpirvBinary(one_zero.spirv);
+    Check(source.find("OpDecorate %out_mrt_1 Location 0") != std::string::npos &&
+              source.find("OpDecorate %out_mrt_1 Index 1") != std::string::npos &&
+              CountSourceOccurrences(source, "OpStore %out_mrt_1 ") == 1 &&
+              SpirvContainsVectorShuffle(one_zero.spirv, {3u, 3u, 3u, 3u}) &&
+              SpirvInstructionOpcodeCount(one_zero.spirv, 82u) >= 3u,
+          "OneAlphaZero did not emit valid dual-source factor export");
   }
 
   const uint32_t guest_shader[] = {

@@ -588,6 +588,18 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 						break;
 					default: break;
 				}
+				if (state.input_info.pixel->alpha_blend_source ==
+				    ShaderAlphaBlendSource::OneAlphaZero) {
+					const auto one_mapping = state.input_info.pixel->target_export_mapping[0];
+					for (uint32_t component = 0; component < 3; component++) {
+						const auto factors = state.builder.AllocateId();
+						state.builder.AddFunction(
+						    spv::OpCompositeInsert, vector_type, factors,
+						    ConstantF32Value(state, one_mapping.Map(component) == 3u ? 0.0f : 1.0f),
+						    alpha, component);
+						alpha = factors;
+					}
+				}
 				if (alpha_factor != 0) {
 					const auto mapping = state.input_info.pixel->target_export_mapping[0];
 					for (uint32_t component = 0; component < 4; component++) {

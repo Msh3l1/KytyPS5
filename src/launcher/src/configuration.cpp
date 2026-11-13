@@ -98,7 +98,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(readback_storage_images);
 	KYTY_CFG_GET(sync_raw_image_buffers);
 	KYTY_CFG_GET(flush_draws);
-	KYTY_CFG_GET(tessellation_enabled);
+	tessellation_enabled = s.value("tessellation_enabled", tessellation_enabled).toBool();
 	KYTY_CFG_GET(occlusion_queries_enabled);
 	KYTY_CFG_GET(relaxed_shader_float);
 	shader_cache_enabled = s.value("shader_cache_enabled", shader_cache_enabled).toBool();

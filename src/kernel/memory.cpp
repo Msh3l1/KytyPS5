@@ -107,6 +107,13 @@ static void UnmapGpuRange(uint64_t vaddr, uint64_t size) {
 	GetGpuResources().UnmapMemory(vaddr, size);
 }
 
+static void ResyncGpuRangeProtection(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		return;
+	}
+	GetGpuResources().ResyncHostProtection(vaddr, size);
+}
+
 static bool DecodeMemoryProtection(int prot, VirtualMemory::Mode* mode) {
 	EXIT_IF(mode == nullptr);
 
@@ -2857,6 +2864,18 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 	return g_guest_address_space->ProtectTransient(vaddr, size, mode);
+}
+
+void AddLiveThreadStack(uint64_t vaddr, uint64_t size) {
+	if (g_guest_address_space != nullptr) {
+		g_guest_address_space->AddLiveStack(vaddr, size);
+	}
+}
+
+void RemoveLiveThreadStack(uint64_t vaddr, uint64_t size) {
+	if (g_guest_address_space != nullptr && g_guest_address_space->RemoveLiveStack(vaddr, size)) {
+		ResyncGpuRangeProtection(vaddr, size);
+	}
 }
 
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {

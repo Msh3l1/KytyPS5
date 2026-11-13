@@ -11,6 +11,7 @@
 #include <windows.h> // IWYU pragma: keep
 // clang-format off
 #include <psapi.h>
+#include <tlhelp32.h>
 // clang-format on
 #elif defined(__APPLE__)
 #include <CoreFoundation/CoreFoundation.h>
@@ -60,6 +61,65 @@ uint64_t FileTimeTo100Ns(const FILETIME& time) {
 
 struct PlatformState {};
 
+void SampleThreads(HostStats& stats, Counters& now) {
+	using GetThreadDescriptionFn = HRESULT(WINAPI*)(HANDLE, PWSTR*);
+	static const auto get_thread_description = []() -> GetThreadDescriptionFn {
+		if (auto* kernel32 = GetModuleHandleW(L"kernel32.dll")) {
+			return reinterpret_cast<GetThreadDescriptionFn>(
+			    GetProcAddress(kernel32, "GetThreadDescription"));
+		}
+		return nullptr;
+	}();
+
+	const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	if (snapshot == INVALID_HANDLE_VALUE) {
+		return;
+	}
+	const DWORD   pid = GetCurrentProcessId();
+	THREADENTRY32 entry {};
+	entry.dwSize   = sizeof(entry);
+	uint32_t count = 0;
+	if (Thread32First(snapshot, &entry) != 0) {
+		do {
+			if (entry.dwSize >= FIELD_OFFSET(THREADENTRY32, th32OwnerProcessID) +
+			                        sizeof(entry.th32OwnerProcessID) &&
+			    entry.th32OwnerProcessID == pid) {
+				count++;
+				if (const HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE,
+				                                     entry.th32ThreadID);
+				    thread != nullptr) {
+					FILETIME creation {};
+					FILETIME exit {};
+					FILETIME kernel {};
+					FILETIME user {};
+					if (GetThreadTimes(thread, &creation, &exit, &kernel, &user) != 0) {
+						auto& sample = now.threads[static_cast<uint64_t>(entry.th32ThreadID)];
+						sample.cpu_ns =
+						    (FileTimeTo100Ns(kernel) + FileTimeTo100Ns(user)) * 100u;
+						if (get_thread_description != nullptr) {
+							PWSTR desc = nullptr;
+							if (SUCCEEDED(get_thread_description(thread, &desc)) && desc != nullptr) {
+								const int needed = WideCharToMultiByte(
+								    CP_UTF8, 0, desc, -1, nullptr, 0, nullptr, nullptr);
+								if (needed > 1) {
+									sample.name.resize(static_cast<size_t>(needed - 1));
+									WideCharToMultiByte(CP_UTF8, 0, desc, -1, sample.name.data(),
+									                    needed, nullptr, nullptr);
+								}
+								LocalFree(desc);
+							}
+						}
+					}
+					CloseHandle(thread);
+				}
+			}
+			entry.dwSize = sizeof(entry);
+		} while (Thread32Next(snapshot, &entry) != 0);
+	}
+	CloseHandle(snapshot);
+	stats.thread_count = count;
+}
+
 void SamplePlatform(PlatformState& /*state*/, HostStats& stats, Counters& now) {
 	const auto process = GetCurrentProcess();
 	FILETIME   creation {};
@@ -98,6 +158,8 @@ void SamplePlatform(PlatformState& /*state*/, HostStats& stats, Counters& now) {
 		                            : system.dwMemoryLoad >= 80 ? MemoryPressure::Warning
 		                                                        : MemoryPressure::Normal;
 	}
+
+	SampleThreads(stats, now);
 }
 
 #else

@@ -14,8 +14,10 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bitset>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <type_traits>
 #include <unordered_set>
@@ -257,7 +259,16 @@ private:
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
-	[[nodiscard]] bool DownloadImageMemory(ImageId id);
+	struct PendingEviction {
+		ImageId                            id;
+		uint64_t                           serial  = 0;
+		uint64_t                           address = 0;
+		uint64_t                           tick    = 0;
+		std::shared_ptr<std::atomic<bool>> landed;
+	};
+
+	[[nodiscard]] bool DownloadImageMemory(ImageId id,
+	                                       std::shared_ptr<std::atomic<bool>>* landed = nullptr);
 	[[nodiscard]] bool DownloadQueuedImages();
 
 	GraphicContext&                                   m_graphics;
@@ -271,6 +282,8 @@ private:
 	ImagePageTable                                    m_image_page_table;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
+	std::vector<PendingEviction>                      m_pending_evictions;
+	std::unordered_set<ImageId>                       m_evicting;
 	std::mutex                                        m_write_back_mutex;
 	std::vector<WriteBack>                            m_write_backs;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;

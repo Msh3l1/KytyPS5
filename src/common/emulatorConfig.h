@@ -80,7 +80,7 @@ struct ConfigOptions {
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
-	bool                   shader_cache_enabled        = false;
+	bool                   shader_cache_enabled        = true;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
 	bool                   command_buffer_dump_enabled = false;
@@ -97,7 +97,7 @@ struct ConfigOptions {
 	bool                   readback_storage_images     = false;
 	bool                   sync_raw_image_buffers      = false;
 	uint32_t               flush_draws                 = 0; // 0 is off
-	bool                   tessellation_enabled        = false;
+	bool                   tessellation_enabled        = true;
 	bool                   occlusion_queries_enabled   = false;
 	bool                   relaxed_shader_float        = false;
 	bool                   native_rt                   = false;
@@ -108,7 +108,7 @@ struct ConfigOptions {
 	bool                   playgo_hack_enabled         = false;
 	bool                   skip_notice_screen          = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	bool red_zone_protection_enabled = false;
+	bool red_zone_protection_enabled = true;
 #endif
 	Keymap keymap;
 	// Ordinary boots need a non-null argv[0]; --guest-exec supplies the caller's arguments.

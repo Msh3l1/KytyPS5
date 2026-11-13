@@ -859,6 +859,9 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		}
 	}
 	ResolveRenderDepthTarget(buffer, targets.depth);
+	if (targets.depth.unsupported) {
+		return false;
+	}
 	// TODO(PPSA09243): Vulkan passes take one sample count. Where PS5 attachments mix counts,
 	// keep those matching the raster count instead of resolving multisampled shadows.
 	const auto colors       = std::span {targets.colors, targets.color_count};
@@ -1087,6 +1090,11 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		}
 	}
 
+	auto* pipeline = m_context.GetPipelineCache().TryGetGraphicsPipeline(buffer, state, m_targets);
+	if (pipeline == nullptr) {
+		return;
+	}
+
 	// Mesh shaders read the original guest indices in whole DWORDs by device address. Their buffer
 	// exists before the descriptors bind, so creating it merges no buffer this draw binds.
 	uint64_t index_begin = 0;
@@ -1129,7 +1137,6 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_targets);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering = AcquireRenderTargets(buffer, m_targets.colors, m_targets.color_count,
 	                                            m_targets.depth, feedback_aspects, stages);
@@ -1158,7 +1165,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
 	}
-	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, *pipeline, stages);
 	if (!mesh_active) {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
@@ -1179,11 +1186,11 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		} else {
 			draw_data[0] = buffer.GetUserConfig().GetObjectId();
 		}
-		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages, 0,
+		vk_buffer.pushConstants(pipeline->pipeline_layout, pipeline->push_stages, 0,
 		                        draw_dwords * sizeof(uint32_t), draw_data.data());
 	}
 	if (const auto planes = vertex_stages.back().user_clip_planes; planes != 0) {
-		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages,
+		vk_buffer.pushConstants(pipeline->pipeline_layout, pipeline->push_stages,
 		                        PushData::UserClipPlaneDword * sizeof(uint32_t),
 		                        std::bit_width(planes) * 4u * sizeof(uint32_t),
 		                        buffer.GetRegisters().GetUserClipPlanes().data());
@@ -1210,7 +1217,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
 	}
 	buffer.BeginRendering(rendering);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->pipeline);
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
 	if (mesh_task) {

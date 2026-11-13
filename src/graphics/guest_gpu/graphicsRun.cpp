@@ -24,6 +24,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -502,7 +503,14 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::FlipPreparation:
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;
-		case SubmissionType::SuspendPoint:
+		case SubmissionType::SuspendPoint: {
+			static const bool flush_before_gc = [] {
+				const char* value = std::getenv("KYTY_FLUSH_BEFORE_GC");
+				return value == nullptr || value[0] != '0';
+			}();
+			if (flush_before_gc) {
+				cp.BufferFlush();
+			}
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(
@@ -510,6 +518,7 @@ bool GuestGpu::Process(Submission& submission) {
 			cp.BufferFlush();
 			cp.Reset();
 			break;
+		}
 	}
 
 	return complete;
