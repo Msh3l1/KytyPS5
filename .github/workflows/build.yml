@@ -64,8 +64,8 @@ jobs:
           cmake --version
           ninja --version
           clang-cl --version
-          glslangValidator --version
-          echo Qt6_DIR=%Qt6_DIR%
+          glslang --version
+          echo QT_ROOT_DIR=%QT_ROOT_DIR%
 
       - name: Configure
         shell: cmd
@@ -81,7 +81,7 @@ jobs:
             -DCMAKE_CXX_COMPILER=clang-cl ^
             -DCMAKE_C_COMPILER_LAUNCHER=sccache ^
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache ^
-            -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
+            -DCMAKE_PREFIX_PATH="%QT_ROOT_DIR%"
 
       - name: Build
         shell: cmd
