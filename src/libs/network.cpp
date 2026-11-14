@@ -62,12 +62,13 @@ public:
 		static constexpr int MAX_ID = 65536;
 
 		enum class Type : uint32_t {
-			Invalid    = 0,
-			Http       = 1,
-			Ssl        = 2,
-			Template   = 3,
-			Connection = 4,
-			Request    = 5,
+			Invalid       = 0,
+			Http          = 1,
+			Ssl           = 2,
+			Template      = 3,
+			Connection    = 4,
+			Request       = 5,
+			SslConnection = 6,
 		};
 
 		explicit Id(int id)
@@ -83,6 +84,7 @@ public:
 				case static_cast<uint32_t>(Type::Template): return Type::Template;
 				case static_cast<uint32_t>(Type::Connection): return Type::Connection;
 				case static_cast<uint32_t>(Type::Request): return Type::Request;
+				case static_cast<uint32_t>(Type::SslConnection): return Type::SslConnection;
 				default: return Type::Invalid;
 			}
 		}
@@ -121,6 +123,24 @@ public:
 	Id   SslInit(uint64_t pool_size);
 	bool SslTerm(Id ssl_ctx_id);
 	bool SslValid(Id ssl_ctx_id);
+	int  SslGetMemoryPoolStats(Id ssl_ctx_id, Net::NetMemoryPoolStats* stats);
+	Id   SslCreateConnection(Id ssl_ctx_id, int sock_id, const char* host);
+	bool SslDeleteConnection(Id ssl_conn_id);
+	bool SslValidConnection(Id ssl_conn_id);
+	bool SslCloseConnection(Id ssl_conn_id);
+	bool SslReuseConnection(Id ssl_conn_id, int sock_id);
+	bool SslEnableVerifyOption(Id ssl_conn_id, uint32_t option);
+	bool SslDisableVerifyOption(Id ssl_conn_id, uint32_t option);
+	bool SslEnableOption(Id ssl_conn_id, uint32_t option);
+	bool SslDisableOption(Id ssl_conn_id, uint32_t option);
+	bool SslEnableOptionInternal(Id ssl_conn_id, uint32_t option);
+	bool SslDisableOptionInternal(Id ssl_conn_id, uint32_t option);
+	bool SslSetMinSslVersion(Id ssl_conn_id, int version);
+	bool SslSetSslVersion(Id ssl_conn_id, int version);
+	bool SslSetVerifyCallback(Id ssl_conn_id, void* cbfunc, void* user_arg);
+	bool SslSetAlpn(Id ssl_conn_id, const char* proto);
+	bool SslSetLastError(Id ssl_conn_id, int error);
+	int  SslGetLastError(Id ssl_conn_id);
 
 	Id   HttpInit(int memid, Id ssl_ctx_id, uint64_t pool_size);
 	bool HttpTerm(Id http_ctx_id);
@@ -166,6 +186,23 @@ private:
 	struct Ssl {
 		bool     used = false;
 		uint64_t size = 0;
+	};
+
+	struct SslConnection {
+		bool        used             = false;
+		int         ssl_ctx_id       = 0;
+		int         sock_id          = -1;
+		std::string host;
+		std::string alpn;
+		uint32_t    verify_options   = 0x25;
+		uint32_t    options          = 0;
+		uint32_t    internal_options = 0;
+		int         min_ssl_version  = 0;
+		int         ssl_version      = 0;
+		void*       verify_cbfunc    = nullptr;
+		void*       verify_user_arg  = nullptr;
+		bool        closed           = false;
+		int         last_error       = SSL_ERROR_SOCKET_CLOSED;
 	};
 
 	struct Resolver {
@@ -229,7 +266,8 @@ private:
 		std::string response_headers;
 	};
 
-	HttpBase* FindHttpBase(Id id, bool include_request);
+	HttpBase*      FindHttpBase(Id id, bool include_request);
+	SslConnection* FindSslConnection(Id ssl_conn_id);
 
 	static constexpr int POOLS_MAX     = 32;
 	static constexpr int RESOLVERS_MAX = 32;
@@ -240,6 +278,7 @@ private:
 	Pool                        m_pools[POOLS_MAX];
 	Resolver                    m_resolvers[RESOLVERS_MAX];
 	Ssl                         m_ssl[SSL_MAX];
+	std::vector<SslConnection>  m_ssl_connections;
 	Http                        m_http[HTTP_MAX];
 	std::vector<HttpTemplate>   m_templates;
 	std::vector<HttpConnection> m_connections;
@@ -361,6 +400,11 @@ bool Network::SslTerm(Id ssl_ctx_id) {
 	if (ssl_ctx_id.GetType() == Id::Type::Ssl && ssl_ctx_id.GetId() >= 0 &&
 	    ssl_ctx_id.GetId() < SSL_MAX && m_ssl[ssl_ctx_id.GetId()].used) {
 		m_ssl[ssl_ctx_id.GetId()].used = false;
+		for (auto& conn: m_ssl_connections) {
+			if (conn.used && conn.ssl_ctx_id == ssl_ctx_id.GetId()) {
+				conn = {};
+			}
+		}
 
 		return true;
 	}
@@ -373,6 +417,246 @@ bool Network::SslValid(Id ssl_ctx_id) {
 
 	return ssl_ctx_id.GetType() == Id::Type::Ssl && ssl_ctx_id.GetId() >= 0 &&
 	       ssl_ctx_id.GetId() < SSL_MAX && m_ssl[ssl_ctx_id.GetId()].used;
+}
+
+int Network::SslGetMemoryPoolStats(Id ssl_ctx_id, Net::NetMemoryPoolStats* stats) {
+	Common::LockGuard lock(m_mutex);
+
+	if (stats == nullptr) {
+		return SSL_ERROR_INVALID_VALUE;
+	}
+
+	*stats = {};
+	if (ssl_ctx_id.GetType() != Id::Type::Ssl || ssl_ctx_id.GetId() < 0 ||
+	    ssl_ctx_id.GetId() >= SSL_MAX || !m_ssl[ssl_ctx_id.GetId()].used) {
+		return SSL_ERROR_INVALID_ID;
+	}
+
+	stats->pool_size = m_ssl[ssl_ctx_id.GetId()].size;
+	return OK;
+}
+
+Network::SslConnection* Network::FindSslConnection(Id ssl_conn_id) {
+	if (ssl_conn_id.GetType() != Id::Type::SslConnection) {
+		return nullptr;
+	}
+	const int index = ssl_conn_id.GetId();
+	if (index < 0 || static_cast<size_t>(index) >= m_ssl_connections.size()) {
+		return nullptr;
+	}
+	auto& conn = m_ssl_connections[static_cast<size_t>(index)];
+	if (!conn.used) {
+		return nullptr;
+	}
+	return &conn;
+}
+
+Network::Id Network::SslCreateConnection(Id ssl_ctx_id, int sock_id, const char* host) {
+	Common::LockGuard lock(m_mutex);
+
+	if (ssl_ctx_id.GetType() != Id::Type::Ssl || ssl_ctx_id.GetId() < 0 ||
+	    ssl_ctx_id.GetId() >= SSL_MAX || !m_ssl[ssl_ctx_id.GetId()].used) {
+		return Id::Invalid();
+	}
+
+	int slot_id = -1;
+	for (size_t i = 0; i < m_ssl_connections.size(); i++) {
+		if (!m_ssl_connections[i].used) {
+			slot_id = static_cast<int>(i);
+			break;
+		}
+	}
+
+	if (slot_id < 0) {
+		if (m_ssl_connections.size() >= static_cast<size_t>(Id::MAX_ID)) {
+			return Id::Invalid();
+		}
+		slot_id = static_cast<int>(m_ssl_connections.size());
+		m_ssl_connections.emplace_back();
+	}
+
+	auto& conn            = m_ssl_connections[static_cast<size_t>(slot_id)];
+	conn                  = {};
+	conn.used             = true;
+	conn.ssl_ctx_id       = ssl_ctx_id.GetId();
+	conn.sock_id          = sock_id;
+	conn.host             = host != nullptr ? std::string(host) : std::string();
+	conn.last_error       = SSL_ERROR_SOCKET_CLOSED;
+
+	return Id::Create(slot_id, Id::Type::SslConnection);
+}
+
+bool Network::SslDeleteConnection(Id ssl_conn_id) {
+	Common::LockGuard lock(m_mutex);
+
+	auto* conn = FindSslConnection(ssl_conn_id);
+	if (conn == nullptr) {
+		return false;
+	}
+	*conn = {};
+	return true;
+}
+
+bool Network::SslValidConnection(Id ssl_conn_id) {
+	Common::LockGuard lock(m_mutex);
+
+	return FindSslConnection(ssl_conn_id) != nullptr;
+}
+
+bool Network::SslCloseConnection(Id ssl_conn_id) {
+	Common::LockGuard lock(m_mutex);
+
+	auto* conn = FindSslConnection(ssl_conn_id);
+	if (conn == nullptr) {
+		return false;
+	}
+	conn->closed = true;
+	return true;
+}
+
+bool Network::SslReuseConnection(Id ssl_conn_id, int sock_id) {
+	Common::LockGuard lock(m_mutex);
+
+	auto* conn = FindSslConnection(ssl_conn_id);
+	if (conn == nullptr) {
+		return false;
+	}
+	conn->sock_id    = sock_id;
+	conn->closed     = false;
+	conn->last_error = SSL_ERROR_SOCKET_CLOSED;
+	return true;
+}
+
+bool Network::SslEnableVerifyOption(Id ssl_conn_id, uint32_t option) {
+	Common::LockGuard lock(m_mutex);
+
+	auto* conn = FindSslConnection(ssl_conn_id);
+	if (conn == nullptr) {
+		return false;
+	}
+	conn->verify_options |= option;
+	return true;
+}
+
+bool Network::SslDisableVerifyOption(Id ssl_conn_id, uint32_t option) {
+	Common::LockGuard lock(m_mutex);
+
+	auto* conn = FindSslConnection(ssl_conn_id);
+	if (conn == nullptr) {
+		return false;
+	}
+	conn->verify_options &= ~option;
+	return true;
+}
+
+bool Network::SslEnableOption(Id ssl_conn_id, uint32_t option) {
+	Common::LockGuard lock(m_mutex);
+
+	auto* conn = FindSslConnection(ssl_conn_id);
+	if (conn == nullptr) {
+		return false;
+	}
+	conn->options |= option;
+	return true;
+}
+
+bool Network::SslDisableOption(Id ssl_conn_id, uint32_t option) {
+	Common::LockGuard lock(m_mutex);
+
+	auto* conn = FindSslConnection(ssl_conn_id);
+	if (conn == nullptr) {
+		return false;
+	}
+	conn->options &= ~option;
+	return true;
+}
+
+bool Network::SslEnableOptionInternal(Id ssl_conn_id, uint32_t option) {
+	Common::LockGuard lock(m_mutex);
+
+	auto* conn = FindSslConnection(ssl_conn_id);
+	if (conn == nullptr) {
+		return false;
+	}
+	conn->internal_options |= option;
+	return true;
+}
+
+bool Network::SslDisableOptionInternal(Id ssl_conn_id, uint32_t option) {
+	Common::LockGuard lock(m_mutex);
+
+	auto* conn = FindSslConnection(ssl_conn_id);
+	if (conn == nullptr) {
+		return false;
+	}
+	conn->internal_options &= ~option;
+	return true;
+}
+
+bool Network::SslSetMinSslVersion(Id ssl_conn_id, int version) {
+	Common::LockGuard lock(m_mutex);
+
+	auto* conn = FindSslConnection(ssl_conn_id);
+	if (conn == nullptr) {
+		return false;
+	}
+	conn->min_ssl_version = version;
+	return true;
+}
+
+bool Network::SslSetSslVersion(Id ssl_conn_id, int version) {
+	Common::LockGuard lock(m_mutex);
+
+	auto* conn = FindSslConnection(ssl_conn_id);
+	if (conn == nullptr) {
+		return false;
+	}
+	conn->ssl_version = version;
+	return true;
+}
+
+bool Network::SslSetVerifyCallback(Id ssl_conn_id, void* cbfunc, void* user_arg) {
+	Common::LockGuard lock(m_mutex);
+
+	auto* conn = FindSslConnection(ssl_conn_id);
+	if (conn == nullptr) {
+		return false;
+	}
+	conn->verify_cbfunc   = cbfunc;
+	conn->verify_user_arg = user_arg;
+	return true;
+}
+
+bool Network::SslSetAlpn(Id ssl_conn_id, const char* proto) {
+	Common::LockGuard lock(m_mutex);
+
+	auto* conn = FindSslConnection(ssl_conn_id);
+	if (conn == nullptr) {
+		return false;
+	}
+	conn->alpn = proto != nullptr ? std::string(proto) : std::string();
+	return true;
+}
+
+bool Network::SslSetLastError(Id ssl_conn_id, int error) {
+	Common::LockGuard lock(m_mutex);
+
+	auto* conn = FindSslConnection(ssl_conn_id);
+	if (conn == nullptr) {
+		return false;
+	}
+	conn->last_error = error;
+	return true;
+}
+
+int Network::SslGetLastError(Id ssl_conn_id) {
+	Common::LockGuard lock(m_mutex);
+
+	auto* conn = FindSslConnection(ssl_conn_id);
+	if (conn == nullptr) {
+		return SSL_ERROR_INVALID_ID;
+	}
+	return conn->last_error;
 }
 
 Network::Id Network::HttpInit(int memid, Id ssl_ctx_id, uint64_t pool_size) {
@@ -2792,9 +3076,11 @@ int KYTY_SYSV_ABI SslInit(uint64_t pool_size) {
 
 	LOGF("\t size = %" PRIu64 "\n", pool_size);
 
-	EXIT_IF(g_net == nullptr);
+	if (pool_size == 0) {
+		return SSL_ERROR_INVALID_VALUE;
+	}
 
-	EXIT_NOT_IMPLEMENTED(pool_size == 0);
+	EXIT_IF(g_net == nullptr);
 
 	auto id = g_net->SslInit(pool_size);
 
@@ -2860,6 +3146,612 @@ int KYTY_SYSV_ABI SslFreeCaCerts(int ssl_ctx_id, void* ca_certs) {
 	certs->cert_data_num = 0;
 	certs->pool          = nullptr;
 
+	return OK;
+}
+
+int KYTY_SYSV_ABI SslGetCaList(int ssl_ctx_id, SslCaList* ca_list) {
+	PRINT_NAME();
+
+	if (ca_list == nullptr) {
+		return SSL_ERROR_INVALID_VALUE;
+	}
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslValid(Network::Id(ssl_ctx_id))) {
+		return SSL_ERROR_INVALID_ID;
+	}
+
+	*ca_list = {};
+	return SSL_ERROR_NOT_FOUND;
+}
+
+int KYTY_SYSV_ABI SslFreeCaList(int ssl_ctx_id, SslCaList* ca_list) {
+	PRINT_NAME();
+
+	if (ca_list == nullptr) {
+		return SSL_ERROR_INVALID_ARG;
+	}
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslValid(Network::Id(ssl_ctx_id))) {
+		return SSL_ERROR_INVALID_ID;
+	}
+
+	*ca_list = {};
+	return OK;
+}
+
+int KYTY_SYSV_ABI SslLoadCert(int ssl_ctx_id, int ca_cert_num, const void* const* ca_list,
+                              const void* cert, const void* priv_key) {
+	PRINT_NAME();
+
+	LOGF("\t ssl_ctx_id = %d, ca_cert_num = %d, ca_list = 0x%016" PRIx64
+	     ", cert = 0x%016" PRIx64 ", priv_key = 0x%016" PRIx64 "\n",
+	     ssl_ctx_id, ca_cert_num, reinterpret_cast<uint64_t>(ca_list),
+	     reinterpret_cast<uint64_t>(cert), reinterpret_cast<uint64_t>(priv_key));
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslValid(Network::Id(ssl_ctx_id))) {
+		return SSL_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI SslUnloadCert(int ssl_ctx_id) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslValid(Network::Id(ssl_ctx_id))) {
+		return SSL_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI SslLoadRootCACert(int ssl_ctx_id) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslValid(Network::Id(ssl_ctx_id))) {
+		return SSL_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI SslGetMemoryPoolStats(int ssl_ctx_id, Net::NetMemoryPoolStats* stats) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+
+	return g_net->SslGetMemoryPoolStats(Network::Id(ssl_ctx_id), stats);
+}
+
+int KYTY_SYSV_ABI SslGetNanoSSLModuleId(int ssl_ctx_id, int* module_id) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslValid(Network::Id(ssl_ctx_id))) {
+		return SSL_ERROR_INVALID_ID;
+	}
+
+	if (module_id != nullptr) {
+		*module_id = ssl_ctx_id;
+	}
+	return OK;
+}
+
+int KYTY_SYSV_ABI SslCreateConnection(int ssl_ctx_id, int sock_id, const char* host) {
+	PRINT_NAME();
+
+	LOGF("\t ssl_ctx_id = %d, sock_id = %d, host = %s\n", ssl_ctx_id, sock_id,
+	     host != nullptr ? host : "<null>");
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslValid(Network::Id(ssl_ctx_id))) {
+		return SSL_ERROR_INVALID_ID;
+	}
+
+	auto id = g_net->SslCreateConnection(Network::Id(ssl_ctx_id), sock_id, host);
+	if (!id.IsValid()) {
+		return SSL_ERROR_OUT_OF_SIZE;
+	}
+
+	return id.ToInt();
+}
+
+int KYTY_SYSV_ABI SslCreateSslConnection(int ssl_ctx_id) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslValid(Network::Id(ssl_ctx_id))) {
+		return SSL_ERROR_INVALID_ID;
+	}
+
+	auto id = g_net->SslCreateConnection(Network::Id(ssl_ctx_id), -1, nullptr);
+	if (!id.IsValid()) {
+		return SSL_ERROR_OUT_OF_SIZE;
+	}
+
+	return id.ToInt();
+}
+
+int KYTY_SYSV_ABI SslDeleteConnection(int ssl_conn_id) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslDeleteConnection(Network::Id(ssl_conn_id))) {
+		return SSL_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI SslDeleteSslConnection(int ssl_conn_id) {
+	return SslDeleteConnection(ssl_conn_id);
+}
+
+int KYTY_SYSV_ABI SslConnect(int ssl_conn_id) {
+	PRINT_NAME();
+
+	LOGF("\t ssl_conn_id = %d\n", ssl_conn_id);
+
+	EXIT_IF(g_net == nullptr);
+
+	const Network::Id conn_id(ssl_conn_id);
+	if (!g_net->SslValidConnection(conn_id)) {
+		return SSL_ERROR_INVALID_ID;
+	}
+
+	g_net->SslSetLastError(conn_id, SSL_ERROR_SOCKET_CLOSED);
+	return SSL_ERROR_SOCKET_CLOSED;
+}
+
+int KYTY_SYSV_ABI SslClose(int ssl_conn_id) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslCloseConnection(Network::Id(ssl_conn_id))) {
+		return SSL_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI SslWrite(int ssl_conn_id, const void* buf, size_t len, int flags) {
+	PRINT_NAME();
+
+	LOGF("\t ssl_conn_id = %d, len = %" PRIu64 ", flags = %d\n", ssl_conn_id,
+	     static_cast<uint64_t>(len), flags);
+
+	EXIT_IF(g_net == nullptr);
+
+	const Network::Id conn_id(ssl_conn_id);
+	if (!g_net->SslValidConnection(conn_id)) {
+		return SSL_ERROR_INVALID_ID;
+	}
+	if (flags != 0) {
+		return SSL_ERROR_INVALID_VALUE;
+	}
+	if (buf == nullptr && len != 0) {
+		return SSL_ERROR_INVALID_ARG;
+	}
+
+	g_net->SslSetLastError(conn_id, SSL_ERROR_SOCKET_CLOSED);
+	return SSL_ERROR_SOCKET_CLOSED;
+}
+
+int KYTY_SYSV_ABI SslRead(int ssl_conn_id, void* buf, size_t len, int flags) {
+	PRINT_NAME();
+
+	LOGF("\t ssl_conn_id = %d, len = %" PRIu64 ", flags = %d\n", ssl_conn_id,
+	     static_cast<uint64_t>(len), flags);
+
+	EXIT_IF(g_net == nullptr);
+
+	const Network::Id conn_id(ssl_conn_id);
+	if (!g_net->SslValidConnection(conn_id)) {
+		return SSL_ERROR_INVALID_ID;
+	}
+	if (static_cast<unsigned int>(flags) > 3u) {
+		return SSL_ERROR_INVALID_VALUE;
+	}
+	if (buf == nullptr && len != 0) {
+		return SSL_ERROR_INVALID_ARG;
+	}
+
+	g_net->SslSetLastError(conn_id, SSL_ERROR_SOCKET_CLOSED);
+	return SSL_ERROR_SOCKET_CLOSED;
+}
+
+int KYTY_SYSV_ABI SslSend(int ssl_conn_id, const void* msg, size_t fulllen) {
+	return SslWrite(ssl_conn_id, msg, fulllen, 0);
+}
+
+int KYTY_SYSV_ABI SslRecv(int ssl_conn_id, void* buf, size_t fulllen) {
+	return SslRead(ssl_conn_id, buf, fulllen, 0);
+}
+
+int KYTY_SYSV_ABI SslCheckRecvPending(int ssl_conn_id) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslValidConnection(Network::Id(ssl_conn_id))) {
+		return SSL_ERROR_INVALID_ID;
+	}
+
+	return 0;
+}
+
+int KYTY_SYSV_ABI SslReuseConnection(int ssl_conn_id, int sock_id) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+
+	const Network::Id conn_id(ssl_conn_id);
+	if (!g_net->SslReuseConnection(conn_id, sock_id)) {
+		return SSL_ERROR_INVALID_ID;
+	}
+
+	return SSL_ERROR_SOCKET_CLOSED;
+}
+
+int KYTY_SYSV_ABI SslEnableVerifyOption(int ssl_conn_id, uint32_t option) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslEnableVerifyOption(Network::Id(ssl_conn_id), option)) {
+		return SSL_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI SslDisableVerifyOption(int ssl_conn_id, uint32_t option) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslDisableVerifyOption(Network::Id(ssl_conn_id), option)) {
+		return SSL_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI SslEnableOption(int ssl_conn_id, uint32_t option) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslEnableOption(Network::Id(ssl_conn_id), option)) {
+		return SSL_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI SslDisableOption(int ssl_conn_id, uint32_t option) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslDisableOption(Network::Id(ssl_conn_id), option)) {
+		return SSL_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI SslEnableOptionInternal(int ssl_conn_id, uint32_t option) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslEnableOptionInternal(Network::Id(ssl_conn_id), option)) {
+		return SSL_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI SslDisableOptionInternal(int ssl_conn_id, uint32_t option) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslDisableOptionInternal(Network::Id(ssl_conn_id), option)) {
+		return SSL_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI SslDisableOptionInternalInsecure(int ssl_conn_id, uint32_t option) {
+	return SslDisableOptionInternal(ssl_conn_id, option);
+}
+
+int KYTY_SYSV_ABI SslSetMinSslVersion(int ssl_conn_id, int version) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslSetMinSslVersion(Network::Id(ssl_conn_id), version)) {
+		return SSL_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI SslSetSslVersion(int ssl_conn_id, int version) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslSetSslVersion(Network::Id(ssl_conn_id), version)) {
+		return SSL_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI SslSetVerifyCallback(int ssl_conn_id, void* cbfunc, void* user_arg) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslSetVerifyCallback(Network::Id(ssl_conn_id), cbfunc, user_arg)) {
+		return SSL_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI SslSetAlpn(int ssl_conn_id, const char* proto) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslSetAlpn(Network::Id(ssl_conn_id), proto)) {
+		return SSL_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+const char* KYTY_SYSV_ABI SslGetAlpnSelected(int ssl_conn_id) {
+	PRINT_NAME();
+	(void)ssl_conn_id;
+	return nullptr;
+}
+
+int KYTY_SYSV_ABI SslGetSslError(int ssl_conn_id) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+
+	return g_net->SslGetLastError(Network::Id(ssl_conn_id));
+}
+
+void* KYTY_SYSV_ABI SslGetPeerCert(int ssl_conn_id) {
+	PRINT_NAME();
+	(void)ssl_conn_id;
+	return nullptr;
+}
+
+void* KYTY_SYSV_ABI SslGetSubjectName(int ssl_ctx_id, void* ssl_cert) {
+	PRINT_NAME();
+	(void)ssl_ctx_id;
+	(void)ssl_cert;
+	return nullptr;
+}
+
+void* KYTY_SYSV_ABI SslGetIssuerName(int ssl_ctx_id, void* ssl_cert) {
+	PRINT_NAME();
+	(void)ssl_ctx_id;
+	(void)ssl_cert;
+	return nullptr;
+}
+
+int KYTY_SYSV_ABI SslFreeSslCertName(int ssl_ctx_id, void* cert_name) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslValid(Network::Id(ssl_ctx_id))) {
+		return SSL_ERROR_INVALID_ID;
+	}
+
+	return cert_name != nullptr ? OK : SSL_ERROR_INVALID_VALUE;
+}
+
+int KYTY_SYSV_ABI SslGetNameEntryCount(int ssl_ctx_id, void* cert_name) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslValid(Network::Id(ssl_ctx_id))) {
+		return SSL_ERROR_INVALID_ID;
+	}
+	if (cert_name == nullptr) {
+		return SSL_ERROR_INVALID_VALUE;
+	}
+
+	return SSL_ERROR_NOT_FOUND;
+}
+
+int KYTY_SYSV_ABI SslGetNameEntryInfo(int ssl_ctx_id, void* cert_name, int entry_num, char* oidname,
+                                      size_t max_oidname_len, char* value, size_t max_value_len,
+                                      size_t* value_len) {
+	PRINT_NAME();
+	(void)entry_num;
+	(void)oidname;
+	(void)max_oidname_len;
+	(void)value;
+	(void)max_value_len;
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslValid(Network::Id(ssl_ctx_id))) {
+		return SSL_ERROR_INVALID_ID;
+	}
+	if (cert_name == nullptr) {
+		return SSL_ERROR_INVALID_VALUE;
+	}
+	if (value_len != nullptr) {
+		*value_len = 0;
+	}
+
+	return SSL_ERROR_NOT_FOUND;
+}
+
+int KYTY_SYSV_ABI SslGetNotBefore(int ssl_ctx_id, void* ssl_cert, uint64_t* begin) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslValid(Network::Id(ssl_ctx_id))) {
+		return SSL_ERROR_INVALID_ID;
+	}
+	if (ssl_cert == nullptr || begin == nullptr) {
+		return SSL_ERROR_INVALID_VALUE;
+	}
+
+	*begin = 0;
+	return SSL_ERROR_NOT_FOUND;
+}
+
+int KYTY_SYSV_ABI SslGetNotAfter(int ssl_ctx_id, void* ssl_cert, uint64_t* limit) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslValid(Network::Id(ssl_ctx_id))) {
+		return SSL_ERROR_INVALID_ID;
+	}
+	if (ssl_cert == nullptr || limit == nullptr) {
+		return SSL_ERROR_INVALID_VALUE;
+	}
+
+	*limit = 0;
+	return SSL_ERROR_NOT_FOUND;
+}
+
+int KYTY_SYSV_ABI SslGetFingerprint(int ssl_ctx_id, void* ssl_cert, int hash_type,
+                                    unsigned char* fingerprint) {
+	PRINT_NAME();
+	(void)hash_type;
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslValid(Network::Id(ssl_ctx_id))) {
+		return SSL_ERROR_INVALID_ID;
+	}
+	if (ssl_cert == nullptr || fingerprint == nullptr) {
+		return SSL_ERROR_INVALID_VALUE;
+	}
+
+	return SSL_ERROR_NOT_FOUND;
+}
+
+int KYTY_SYSV_ABI SslGetSerialNumber(int ssl_ctx_id, void* ssl_cert, unsigned char* sbo_data,
+                                     size_t* sbo_len) {
+	PRINT_NAME();
+	(void)sbo_data;
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslValid(Network::Id(ssl_ctx_id))) {
+		return SSL_ERROR_INVALID_ID;
+	}
+	if (ssl_cert == nullptr) {
+		return SSL_ERROR_INVALID_VALUE;
+	}
+	if (sbo_len != nullptr) {
+		*sbo_len = 0;
+	}
+
+	return SSL_ERROR_NOT_FOUND;
+}
+
+int KYTY_SYSV_ABI SslGetPem(int ssl_ctx_id, void* ssl_cert, char* buf, size_t* buf_len) {
+	PRINT_NAME();
+	(void)buf;
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->SslValid(Network::Id(ssl_ctx_id))) {
+		return SSL_ERROR_INVALID_ID;
+	}
+	if (ssl_cert == nullptr || buf_len == nullptr) {
+		return SSL_ERROR_INVALID_VALUE;
+	}
+
+	*buf_len = 0;
+	return SSL_ERROR_NOT_FOUND;
+}
+
+int KYTY_SYSV_ABI SslCaMgmtExtractKeyBlobEx(int arg0, const void* key_blob, uint32_t arg2,
+                                            void* key) {
+	PRINT_NAME();
+	(void)arg0;
+	(void)arg2;
+
+	if (key_blob == nullptr || key == nullptr) {
+		return SSL_ERROR_INVALID_ARG;
+	}
+
+	std::memcpy(static_cast<uint8_t*>(key) + 8, &key_blob, sizeof(key_blob));
+	return OK;
+}
+
+int KYTY_SYSV_ABI SslCaMgmtExtractPublicKeyInfo() {
+	PRINT_NAME();
+	return SSL_ERROR_NOT_FOUND;
+}
+
+int KYTY_SYSV_ABI SslCaMgmtFreeKeyBlob() {
+	PRINT_NAME();
+	return OK;
+}
+
+int KYTY_SYSV_ABI SslCryptoInitAsymmetricKey(void* key) {
+	PRINT_NAME();
+
+	if (key == nullptr) {
+		return SSL_ERROR_INVALID_ARG;
+	}
+
+	const uint32_t initialized = 1;
+	std::memcpy(key, &initialized, sizeof(initialized));
+	return OK;
+}
+
+int KYTY_SYSV_ABI SslCryptoUninitAsymmetricKey() {
+	PRINT_NAME();
+	return OK;
+}
+
+int KYTY_SYSV_ABI SslRsaVerifySignature() {
+	PRINT_NAME();
+	return SSL_ERROR_INTERNAL;
+}
+
+int KYTY_SYSV_ABI SslVlongFreeVlongQueue() {
+	PRINT_NAME();
 	return OK;
 }
 

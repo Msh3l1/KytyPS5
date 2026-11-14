@@ -109,10 +109,71 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 
 namespace Ssl {
 
-int KYTY_SYSV_ABI SslInit(uint64_t pool_size);
-int KYTY_SYSV_ABI SslTerm(int ssl_ctx_id);
-int KYTY_SYSV_ABI SslGetCaCerts(int ssl_ctx_id, void* ca_certs);
-int KYTY_SYSV_ABI SslFreeCaCerts(int ssl_ctx_id, void* ca_certs);
+struct SslCaList {
+	void** certs = nullptr;
+	int    num   = 0;
+};
+
+int KYTY_SYSV_ABI         SslInit(uint64_t pool_size);
+int KYTY_SYSV_ABI         SslTerm(int ssl_ctx_id);
+int KYTY_SYSV_ABI         SslGetCaCerts(int ssl_ctx_id, void* ca_certs);
+int KYTY_SYSV_ABI         SslFreeCaCerts(int ssl_ctx_id, void* ca_certs);
+int KYTY_SYSV_ABI         SslGetCaList(int ssl_ctx_id, SslCaList* ca_list);
+int KYTY_SYSV_ABI         SslFreeCaList(int ssl_ctx_id, SslCaList* ca_list);
+int KYTY_SYSV_ABI         SslLoadCert(int ssl_ctx_id, int ca_cert_num, const void* const* ca_list,
+                                      const void* cert, const void* priv_key);
+int KYTY_SYSV_ABI         SslUnloadCert(int ssl_ctx_id);
+int KYTY_SYSV_ABI         SslLoadRootCACert(int ssl_ctx_id);
+int KYTY_SYSV_ABI         SslGetMemoryPoolStats(int ssl_ctx_id, Net::NetMemoryPoolStats* stats);
+int KYTY_SYSV_ABI         SslGetNanoSSLModuleId(int ssl_ctx_id, int* module_id);
+int KYTY_SYSV_ABI         SslCreateConnection(int ssl_ctx_id, int sock_id, const char* host);
+int KYTY_SYSV_ABI         SslCreateSslConnection(int ssl_ctx_id);
+int KYTY_SYSV_ABI         SslDeleteConnection(int ssl_conn_id);
+int KYTY_SYSV_ABI         SslDeleteSslConnection(int ssl_conn_id);
+int KYTY_SYSV_ABI         SslConnect(int ssl_conn_id);
+int KYTY_SYSV_ABI         SslClose(int ssl_conn_id);
+int KYTY_SYSV_ABI         SslWrite(int ssl_conn_id, const void* buf, size_t len, int flags);
+int KYTY_SYSV_ABI         SslRead(int ssl_conn_id, void* buf, size_t len, int flags);
+int KYTY_SYSV_ABI         SslSend(int ssl_conn_id, const void* msg, size_t fulllen);
+int KYTY_SYSV_ABI         SslRecv(int ssl_conn_id, void* buf, size_t fulllen);
+int KYTY_SYSV_ABI         SslCheckRecvPending(int ssl_conn_id);
+int KYTY_SYSV_ABI         SslReuseConnection(int ssl_conn_id, int sock_id);
+int KYTY_SYSV_ABI         SslEnableVerifyOption(int ssl_conn_id, uint32_t option);
+int KYTY_SYSV_ABI         SslDisableVerifyOption(int ssl_conn_id, uint32_t option);
+int KYTY_SYSV_ABI         SslEnableOption(int ssl_conn_id, uint32_t option);
+int KYTY_SYSV_ABI         SslDisableOption(int ssl_conn_id, uint32_t option);
+int KYTY_SYSV_ABI         SslEnableOptionInternal(int ssl_conn_id, uint32_t option);
+int KYTY_SYSV_ABI         SslDisableOptionInternal(int ssl_conn_id, uint32_t option);
+int KYTY_SYSV_ABI         SslDisableOptionInternalInsecure(int ssl_conn_id, uint32_t option);
+int KYTY_SYSV_ABI         SslSetMinSslVersion(int ssl_conn_id, int version);
+int KYTY_SYSV_ABI         SslSetSslVersion(int ssl_conn_id, int version);
+int KYTY_SYSV_ABI         SslSetVerifyCallback(int ssl_conn_id, void* cbfunc, void* user_arg);
+int KYTY_SYSV_ABI         SslSetAlpn(int ssl_conn_id, const char* proto);
+const char* KYTY_SYSV_ABI SslGetAlpnSelected(int ssl_conn_id);
+int KYTY_SYSV_ABI         SslGetSslError(int ssl_conn_id);
+void* KYTY_SYSV_ABI       SslGetPeerCert(int ssl_conn_id);
+void* KYTY_SYSV_ABI       SslGetSubjectName(int ssl_ctx_id, void* ssl_cert);
+void* KYTY_SYSV_ABI       SslGetIssuerName(int ssl_ctx_id, void* ssl_cert);
+int KYTY_SYSV_ABI         SslFreeSslCertName(int ssl_ctx_id, void* cert_name);
+int KYTY_SYSV_ABI         SslGetNameEntryCount(int ssl_ctx_id, void* cert_name);
+int KYTY_SYSV_ABI         SslGetNameEntryInfo(int ssl_ctx_id, void* cert_name, int entry_num,
+                                              char* oidname, size_t max_oidname_len, char* value,
+                                              size_t max_value_len, size_t* value_len);
+int KYTY_SYSV_ABI         SslGetNotBefore(int ssl_ctx_id, void* ssl_cert, uint64_t* begin);
+int KYTY_SYSV_ABI         SslGetNotAfter(int ssl_ctx_id, void* ssl_cert, uint64_t* limit);
+int KYTY_SYSV_ABI         SslGetFingerprint(int ssl_ctx_id, void* ssl_cert, int hash_type,
+                                            unsigned char* fingerprint);
+int KYTY_SYSV_ABI         SslGetSerialNumber(int ssl_ctx_id, void* ssl_cert, unsigned char* sbo_data,
+                                             size_t* sbo_len);
+int KYTY_SYSV_ABI         SslGetPem(int ssl_ctx_id, void* ssl_cert, char* buf, size_t* buf_len);
+int KYTY_SYSV_ABI         SslCaMgmtExtractKeyBlobEx(int arg0, const void* key_blob, uint32_t arg2,
+                                                    void* key);
+int KYTY_SYSV_ABI         SslCaMgmtExtractPublicKeyInfo();
+int KYTY_SYSV_ABI         SslCaMgmtFreeKeyBlob();
+int KYTY_SYSV_ABI         SslCryptoInitAsymmetricKey(void* key);
+int KYTY_SYSV_ABI         SslCryptoUninitAsymmetricKey();
+int KYTY_SYSV_ABI         SslRsaVerifySignature();
+int KYTY_SYSV_ABI         SslVlongFreeVlongQueue();
 
 } // namespace Ssl
 
